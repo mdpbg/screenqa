@@ -1,0 +1,1056 @@
+name: 云端编译 ScreenQA APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 展开工程源码
+        run: |
+          set -e
+          mkdir -p app app/src/main app/src/main/assets app/src/main/java/com/example/screenqa app/src/main/res/values
+          cat > .gitignore <<'SQEOF_1'
+          *.iml
+          .gradle/
+          /build/
+          /app/build/
+          /local.properties
+          /.idea/
+          .DS_Store
+          /captures/
+          .externalNativeBuild
+          .cxx/
+          SQEOF_1
+          cat > app/build.gradle.kts <<'SQEOF_2'
+          import java.util.Properties
+          
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          
+          // 密钥只从环境变量 / Gradle 属性 / 本地 local.properties 读取，绝不写进仓库。
+          // 云端构建时可用 Secret 注入；不注入也没关系，App 内可自行填写 Key。
+          val localProperties = Properties().apply {
+              val file = rootProject.file("local.properties")
+              if (file.exists()) file.inputStream().use { load(it) }
+          }
+          val rawKey = listOfNotNull(
+              System.getenv("DEEPSEEK_API_KEY"),
+              providers.gradleProperty("DEEPSEEK_API_KEY").orNull,
+              localProperties.getProperty("DEEPSEEK_API_KEY")
+          ).firstOrNull { it.isNotBlank() }?.trim() ?: ""
+          val deepSeekKey = rawKey.replace("\\", "\\\\").replace("\"", "\\\"")
+          
+          android {
+              namespace = "com.example.screenqa"
+              compileSdk = 35
+          
+              defaultConfig {
+                  applicationId = "com.example.screenqa"
+                  minSdk = 29              // Android 10+
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+                  buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekKey\"")
+              }
+          
+              buildFeatures {
+                  buildConfig = true       // AGP 8+ 默认不生成 BuildConfig，必须显式打开
+              }
+          
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.activity:activity-ktx:1.9.3")
+          
+              // 中文 OCR：chinese 提供打包模型，text-recognition 提供 ChineseTextRecognizerOptions 等配置类
+              implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+          
+              implementation("com.squareup.okhttp3:okhttp:5.5.0")
+          
+              // 注意：org.json 由 Android 平台自带，不需要额外依赖，加了反而容易 duplicate class
+          }
+          SQEOF_2
+          cat > app/src/main/AndroidManifest.xml <<'SQEOF_3'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <!-- Android 14 (API 34) 起，mediaProjection 类型的前台服务必须声明此权限 -->
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <!-- Android 13 (API 33) 起需要运行时申请 -->
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+          
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/ic_menu_search"
+                  android:label="屏幕答题助手"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.ScreenQA"
+                  android:usesCleartextTraffic="false">
+          
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+          
+                  <service
+                      android:name=".FloatService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          
+          </manifest>
+          SQEOF_3
+          cat > app/src/main/assets/qa.csv <<'SQEOF_4'
+          question,answer
+          中国的首都是哪里,北京
+          1+1等于几,2
+          OSI参考模型中负责把数据封装成帧的是哪一层,数据链路层
+          IPv4地址由多少位二进制组成,32位
+          TCP三次握手中第一个报文置位的标志位是什么,SYN
+          192.168.1.0/24网段的广播地址是什么,192.168.1.255
+          交换机依据哪种地址转发数据帧,MAC地址
+          默认网关的作用是什么,为本网段以外的流量提供下一跳出口
+          "下列协议中属于传输层，且面向连接的是哪一个","TCP。UDP 面向无连接，IP 属于网络层"
+          SQEOF_4
+          cat > app/src/main/java/com/example/screenqa/AiClient.kt <<'SQEOF_5'
+          package com.example.screenqa
+          
+          import android.content.Context
+          import okhttp3.Call
+          import okhttp3.Callback
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import okhttp3.Response
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.IOException
+          import java.util.concurrent.TimeUnit
+          
+          /**
+           * AI 兜底：DeepSeek（兼容 OpenAI chat/completions 格式）。
+           * Key 优先取手机上 App 内填写的值，其次取构建时注入的 BuildConfig 值。
+           * 回调在 OkHttp 的工作线程执行，调用方需自行切回主线程更新 UI。
+           */
+          object AiClient {
+          
+              private const val URL = "https://api.deepseek.com/chat/completions"
+              private const val PREF_NAME = "screenqa_prefs"
+              private const val PREF_KEY = "deepseek_api_key"
+          
+              private val client = OkHttpClient.Builder()
+                  .connectTimeout(15, TimeUnit.SECONDS)
+                  .readTimeout(60, TimeUnit.SECONDS)
+                  .writeTimeout(30, TimeUnit.SECONDS)
+                  .build()
+          
+              fun readKey(context: Context): String =
+                  context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                      .getString(PREF_KEY, null)
+                      ?.takeIf { it.isNotBlank() }
+                      ?: BuildConfig.DEEPSEEK_API_KEY
+          
+              fun saveKey(context: Context, key: String) {
+                  context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                      .edit()
+                      .putString(PREF_KEY, key.trim())
+                      .apply()
+              }
+          
+              fun isConfigured(context: Context): Boolean = readKey(context).isNotBlank()
+          
+              fun ask(context: Context, question: String, callback: (String) -> Unit) {
+                  val key = readKey(context)
+                  if (key.isBlank()) {
+                      callback("未配置 API Key：请打开 App 填写并保存 DeepSeek Key。题库命中不受影响。")
+                      return
+                  }
+          
+                  // 用 JSONObject 构造请求体，避免手工拼接 JSON 时的转义问题
+                  val requestBody = JSONObject().apply {
+                      put("model", "deepseek-chat")
+                      put("temperature", 0)
+                      put("messages", JSONArray().apply {
+                          put(JSONObject().apply {
+                              put("role", "system")
+                              put("content", "你是答题助手，用于课后练习自测。只给最终答案，以及不超过两行的简要解析。")
+                          })
+                          put(JSONObject().apply {
+                              put("role", "user")
+                              put("content", question.take(4000))
+                          })
+                      })
+                  }.toString()
+          
+                  val request = Request.Builder()
+                      .url(URL)
+                      .header("Authorization", "Bearer $key")
+                      .post(requestBody.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                      .build()
+          
+                  client.newCall(request).enqueue(object : Callback {
+                      override fun onFailure(call: Call, e: IOException) {
+                          callback("AI 请求失败：${e.message ?: "网络异常，请检查网络"}")
+                      }
+          
+                      override fun onResponse(call: Call, response: Response) {
+                          response.use { resp ->
+                              val body = resp.body?.string().orEmpty()
+                              val answer = if (!resp.isSuccessful) {
+                                  "AI 接口 HTTP ${resp.code}：${body.take(200)}"
+                              } else {
+                                  try {
+                                      JSONObject(body)
+                                          .getJSONArray("choices")
+                                          .getJSONObject(0)
+                                          .getJSONObject("message")
+                                          .getString("content")
+                                          .trim()
+                                          .ifEmpty { "AI 返回空内容" }
+                                  } catch (e: Exception) {
+                                      "解析失败：${body.take(200)}"
+                                  }
+                              }
+                              callback(answer)
+                          }
+                      }
+                  })
+              }
+          }
+          SQEOF_5
+          cat > app/src/main/java/com/example/screenqa/FloatService.kt <<'SQEOF_6'
+          package com.example.screenqa
+          
+          import android.app.Activity
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+          import java.util.concurrent.atomic.AtomicBoolean
+          
+          /**
+           * 悬浮窗 + 截屏 + OCR + 查库 / AI。
+           * Android 14 起：必须先以 mediaProjection 类型进入前台，再 getMediaProjection()，
+           * 且 createVirtualDisplay() 之前必须注册 MediaProjection.Callback，否则抛异常。
+           */
+          class FloatService : Service() {
+          
+              private lateinit var windowManager: WindowManager
+              private lateinit var floatView: View
+              private lateinit var resultText: TextView
+              private lateinit var overlayParams: WindowManager.LayoutParams
+              private lateinit var db: QaDb
+              private lateinit var mainHandler: Handler
+              private lateinit var captureHandler: Handler
+              private val captureThread = HandlerThread("ScreenQaCapture").apply { start() }
+          
+              private var projection: MediaProjection? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var imageReader: ImageReader? = null
+              private var viewAdded = false
+              private var pendingResult: String? = null
+          
+              @Volatile
+              private var capturing = false
+          
+              private val recognizer by lazy {
+                  TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+              }
+          
+              override fun onCreate() {
+                  super.onCreate()
+                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+                  db = QaDb(this)
+                  mainHandler = Handler(Looper.getMainLooper())
+                  captureHandler = Handler(captureThread.looper)
+              }
+          
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  createNotificationChannel()
+          
+                  // 显式带类型，满足 Android 10+ / 14 的前台服务约束；必须先于 getMediaProjection
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      startForeground(
+                          NOTIFICATION_ID, buildNotification(),
+                          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                      )
+                  } else {
+                      startForeground(NOTIFICATION_ID, buildNotification())
+                  }
+          
+                  @Suppress("DEPRECATION")
+                  fun legacyData(): Intent? = intent?.getParcelableExtra(EXTRA_DATA)
+          
+                  val code = intent?.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                      ?: Activity.RESULT_CANCELED
+                  val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      intent?.getParcelableExtra(EXTRA_DATA, Intent::class.java)
+                  } else {
+                      legacyData()
+                  }
+          
+                  if (code == Activity.RESULT_OK && data != null) {
+                      releaseProjection()
+                      try {
+                          val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                              as MediaProjectionManager
+                          projection = manager.getMediaProjection(code, data)
+                          projection?.registerCallback(object : MediaProjection.Callback() {
+                              override fun onStop() {
+                                  stopSelf()
+                              }
+                          }, mainHandler)
+                      } catch (e: SecurityException) {
+                          projection = null
+                          setResult("屏幕捕获授权已失效，请打开 App 重新授权一次。\n${e.message.orEmpty()}")
+                      }
+                  } else {
+                      setResult("缺少屏幕捕获授权，请打开 App 点第 ② 步重新授权。")
+                  }
+          
+                  if (!viewAdded) addFloatView()
+                  // Android 14+ 的授权令牌只能消费一次，服务被重建后必须重新授权，故不用 START_STICKY
+                  return START_NOT_STICKY
+              }
+          
+              private fun addFloatView() {
+                  val header = TextView(this).apply {
+                      text = "≡ 屏幕答题助手（按住拖动）"
+                      setTextColor(0xFFFFFFFF.toInt())
+                      textSize = 13f
+                      setBackgroundColor(0xFF2B2B2B.toInt())
+                      setPadding(16, 10, 16, 10)
+                  }
+                  val captureButton = Button(this).apply {
+                      text = "识别当前屏幕"
+                      setOnClickListener { captureScreen() }
+                  }
+                  val closeButton = Button(this).apply {
+                      text = "关闭"
+                      setOnClickListener { stopSelf() }
+                  }
+                  resultText = TextView(this).apply {
+                      setTextColor(0xFFFFFFFF.toInt())
+                      textSize = 14f
+                      setPadding(16, 12, 16, 16)
+                      maxWidth = (resources.displayMetrics.widthPixels * 0.85f).toInt()
+                      text = "等待识别…"
+                  }
+                  val buttonRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      addView(
+                          captureButton,
+                          LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                      )
+                      addView(
+                          closeButton,
+                          LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                      )
+                  }
+                  floatView = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(0xDD111111.toInt())
+                      addView(
+                          header,
+                          LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.MATCH_PARENT,
+                              LinearLayout.LayoutParams.WRAP_CONTENT
+                          )
+                      )
+                      addView(
+                          buttonRow,
+                          LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.MATCH_PARENT,
+                              LinearLayout.LayoutParams.WRAP_CONTENT
+                          )
+                      )
+                      addView(
+                          resultText,
+                          LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.WRAP_CONTENT,
+                              LinearLayout.LayoutParams.WRAP_CONTENT
+                          )
+                      )
+                  }
+          
+                  overlayParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                      else
+                          WindowManager.LayoutParams.TYPE_PHONE,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 40
+                      y = 200
+                  }
+          
+                  var initialX = 0
+                  var initialY = 0
+                  var downX = 0f
+                  var downY = 0f
+                  header.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              initialX = overlayParams.x
+                              initialY = overlayParams.y
+                              downX = event.rawX
+                              downY = event.rawY
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              overlayParams.x = initialX + (event.rawX - downX).toInt()
+                              overlayParams.y = initialY + (event.rawY - downY).toInt()
+                              if (viewAdded) {
+                                  runCatching { windowManager.updateViewLayout(floatView, overlayParams) }
+                              }
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+          
+                  runCatching {
+                      windowManager.addView(floatView, overlayParams)
+                      viewAdded = true
+                  }.onFailure {
+                      setResult("悬浮窗添加失败：${it.message}")
+                  }
+                  pendingResult?.let {
+                      resultText.text = it
+                      pendingResult = null
+                  }
+              }
+          
+              private fun captureScreen() {
+                  if (capturing) return
+                  val p = projection ?: run {
+                      setResult("没有屏幕捕获权限，请打开 App 重新授权一次。")
+                      return
+                  }
+                  val metrics = resources.displayMetrics
+                  val width = metrics.widthPixels
+                  val height = metrics.heightPixels
+                  val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+                  imageReader = reader
+                  val consumed = AtomicBoolean(false)
+          
+                  try {
+                      virtualDisplay = p.createVirtualDisplay(
+                          "ScreenQaCapture", width, height, metrics.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                          reader.surface, null, null
+                      )
+                  } catch (e: Exception) {
+                      setResult("创建截屏失败：${e.message}")
+                      runCatching { reader.close() }
+                      imageReader = null
+                      return
+                  }
+          
+                  capturing = true
+                  setResult("正在截屏并识别…")
+                  reader.setOnImageAvailableListener({ r ->
+                      if (!consumed.compareAndSet(false, true)) return@setOnImageAvailableListener
+                      val image = r.acquireLatestImage()
+                      if (image == null) {
+                          consumed.set(false)
+                          return@setOnImageAvailableListener
+                      }
+                      val bitmap = runCatching { imageToBitmap(image) }.getOrNull()
+                      image.close()
+                      mainHandler.post {
+                          runCatching { virtualDisplay?.release() }
+                          virtualDisplay = null
+                          runCatching { r.close() }
+                          if (imageReader === r) imageReader = null
+                          capturing = false
+                          if (bitmap == null) setResult("截屏数据为空，请重试。") else runOcr(bitmap)
+                      }
+                  }, captureHandler)
+              }
+          
+              /** 必须处理 rowStride / pixelStride，否则部分机型截出来的图是斜的 */
+              private fun imageToBitmap(image: Image): Bitmap {
+                  val plane = image.planes[0]
+                  val pixelStride = plane.pixelStride
+                  val rowStride = plane.rowStride
+                  val rowPadding = rowStride - pixelStride * image.width
+                  val paddedWidth = image.width + rowPadding / pixelStride
+                  val raw = Bitmap.createBitmap(paddedWidth, image.height, Bitmap.Config.ARGB_8888)
+                  raw.copyPixelsFromBuffer(plane.buffer)
+                  return if (rowPadding == 0) {
+                      raw
+                  } else {
+                      Bitmap.createBitmap(raw, 0, 0, image.width, image.height)
+                  }
+              }
+          
+              private fun runOcr(bitmap: Bitmap) {
+                  recognizer.process(InputImage.fromBitmap(bitmap, 0))
+                      .addOnSuccessListener { visionText ->
+                          bitmap.recycle()
+                          handleQuestion(visionText.text)
+                      }
+                      .addOnFailureListener { e ->
+                          bitmap.recycle()
+                          setResult("OCR 失败：${e.message}")
+                      }
+              }
+          
+              private fun handleQuestion(ocrText: String) {
+                  val cleaned = ocrText.trim()
+                  if (cleaned.isEmpty()) {
+                      setResult("没有识别到文字，换个页面再试。")
+                      return
+                  }
+                  val localAnswer = db.search(cleaned)
+                  if (localAnswer != null) {
+                      setResult("【题库命中】\n$localAnswer")
+                      return
+                  }
+                  if (!AiClient.isConfigured(this)) {
+                      setResult("题库未命中，且未配置 API Key。\n请打开 App 填写 DeepSeek Key。\n\n识别到的文字：${cleaned.take(120)}")
+                      return
+                  }
+                  setResult("题库未命中，AI 解答中…")
+                  AiClient.ask(this, cleaned) { answer ->
+                      mainHandler.post { setResult("【AI】\n$answer") }
+                  }
+              }
+          
+              private fun setResult(text: String) {
+                  val task = {
+                      if (::resultText.isInitialized) {
+                          resultText.text = text
+                      } else {
+                          pendingResult = text
+                      }
+                  }
+                  if (Looper.myLooper() == Looper.getMainLooper()) task() else mainHandler.post(task)
+              }
+          
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          CHANNEL_ID, "答题助手", NotificationManager.IMPORTANCE_LOW
+                      )
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                  }
+              }
+          
+              private fun buildNotification(): Notification {
+                  @Suppress("DEPRECATION")
+                  fun legacyBuilder(): Notification.Builder = Notification.Builder(this)
+                  val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, CHANNEL_ID)
+                  } else {
+                      legacyBuilder()
+                  }
+                  return builder
+                      .setContentTitle("屏幕答题助手运行中")
+                      .setContentText("切到题目页面后点悬浮窗按钮识别")
+                      .setSmallIcon(android.R.drawable.ic_menu_search)
+                      .setOngoing(true)
+                      .build()
+              }
+          
+              private fun releaseProjection() {
+                  runCatching { virtualDisplay?.release() }
+                  virtualDisplay = null
+                  runCatching { imageReader?.close() }
+                  imageReader = null
+                  runCatching { projection?.stop() }
+                  projection = null
+                  capturing = false
+              }
+          
+              override fun onDestroy() {
+                  releaseProjection()
+                  if (viewAdded) {
+                      runCatching { windowManager.removeView(floatView) }
+                      viewAdded = false
+                  }
+                  runCatching { db.close() }
+                  captureThread.quitSafely()
+                  super.onDestroy()
+              }
+          
+              override fun onBind(intent: Intent?): IBinder? = null
+          
+              companion object {
+                  const val EXTRA_RESULT_CODE = "resultCode"
+                  const val EXTRA_DATA = "data"
+                  private const val CHANNEL_ID = "screenqa"
+                  private const val NOTIFICATION_ID = 1
+              }
+          }
+          SQEOF_6
+          cat > app/src/main/java/com/example/screenqa/MainActivity.kt <<'SQEOF_7'
+          package com.example.screenqa
+          
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+          
+          class MainActivity : AppCompatActivity() {
+          
+              private lateinit var statusText: TextView
+              private lateinit var keyInput: EditText
+              private lateinit var projectionManager: MediaProjectionManager
+          
+              private val notificationPermission =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+                      refreshStatus()
+                  }
+          
+              private val captureLauncher =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                      val data = result.data
+                      if (result.resultCode == RESULT_OK && data != null) {
+                          val serviceIntent = Intent(this, FloatService::class.java).apply {
+                              putExtra(FloatService.EXTRA_RESULT_CODE, result.resultCode)
+                              putExtra(FloatService.EXTRA_DATA, data)
+                          }
+                          try {
+                              ContextCompat.startForegroundService(this, serviceIntent)
+                              statusText.text = "已授权，悬浮窗已启动。现在可以切到题目页面使用了。"
+                          } catch (e: SecurityException) {
+                              statusText.text = "启动失败：${e.message}。请确认通知与悬浮窗权限都已开启。"
+                          }
+                      } else {
+                          statusText.text = "已取消授权，悬浮窗未启动。"
+                      }
+                  }
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  buildUi()
+                  requestNotificationPermissionIfNeeded()
+                  refreshStatus()
+              }
+          
+              override fun onResume() {
+                  super.onResume()
+                  refreshStatus()
+              }
+          
+              private fun buildUi() {
+                  fun lp() = LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT
+                  ).apply { topMargin = dp(12) }
+          
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(24), dp(32), dp(24), dp(24))
+                  }
+          
+                  val title = TextView(this).apply {
+                      text = "屏幕答题助手"
+                      textSize = 22f
+                      setTypeface(null, Typeface.BOLD)
+                  }
+                  val intro = TextView(this).apply {
+                      text = "截屏 → OCR 识别题目 → 先查本地题库 → 未命中再问 AI。\n建议用于课后练习自测。"
+                      textSize = 13f
+                  }
+                  statusText = TextView(this).apply {
+                      textSize = 14f
+                      setPadding(0, dp(12), 0, dp(12))
+                  }
+                  val overlayButton = Button(this).apply {
+                      text = "① 开启悬浮窗权限"
+                      setOnClickListener { openOverlaySettings() }
+                  }
+                  val startButton = Button(this).apply {
+                      text = "② 授权屏幕捕获并启动悬浮窗"
+                      setOnClickListener { startCapture() }
+                  }
+                  val stopButton = Button(this).apply {
+                      text = "停止悬浮窗"
+                      setOnClickListener {
+                          stopService(Intent(this@MainActivity, FloatService::class.java))
+                          toast("已停止")
+                          refreshStatus()
+                      }
+                  }
+                  val keyTitle = TextView(this).apply {
+                      text = "DeepSeek API Key（可选，仅 AI 兜底需要）"
+                      textSize = 13f
+                  }
+                  keyInput = EditText(this).apply {
+                      hint = "sk-... 填写后点保存，只保存在本机 App 内"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      setText(AiClient.readKey(this@MainActivity))
+                  }
+                  val saveKeyButton = Button(this).apply {
+                      text = "保存 Key"
+                      setOnClickListener {
+                          AiClient.saveKey(this@MainActivity, keyInput.text.toString())
+                          toast("已保存")
+                          refreshStatus()
+                      }
+                  }
+                  val tip = TextView(this).apply {
+                      text = "用法：授权后切到其他 App，点悬浮窗上的「识别当前屏幕」。\n" +
+                          "修改 assets/qa.csv 后，需把 QaDb 里的 DB_VERSION 加 1 才会重新导入。"
+                      textSize = 12f
+                  }
+          
+                  root.addView(title, lp())
+                  root.addView(intro, lp())
+                  root.addView(statusText, lp())
+                  root.addView(overlayButton, lp())
+                  root.addView(startButton, lp())
+                  root.addView(stopButton, lp())
+                  root.addView(keyTitle, lp())
+                  root.addView(keyInput, lp())
+                  root.addView(saveKeyButton, lp())
+                  root.addView(tip, lp())
+                  setContentView(root)
+              }
+          
+              private fun startCapture() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      toast("请先开启悬浮窗权限")
+                      openOverlaySettings()
+                      return
+                  }
+                  if (notificationsDenied()) {
+                      toast("请先允许通知权限")
+                      requestNotificationPermissionIfNeeded()
+                      return
+                  }
+                  captureLauncher.launch(projectionManager.createScreenCaptureIntent())
+              }
+          
+              private fun openOverlaySettings() {
+                  startActivity(
+                      Intent(
+                          Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                          Uri.parse("package:$packageName")
+                      )
+                  )
+              }
+          
+              private fun notificationsDenied(): Boolean =
+                  Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                      ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+                      PackageManager.PERMISSION_GRANTED
+          
+              private fun requestNotificationPermissionIfNeeded() {
+                  if (notificationsDenied()) {
+                      notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+              }
+          
+              private fun refreshStatus() {
+                  val overlay = Settings.canDrawOverlays(this)
+                  val notify = !notificationsDenied()
+                  val key = AiClient.isConfigured(this)
+                  statusText.text = buildString {
+                      append("悬浮窗权限：").append(if (overlay) "已开启" else "未开启").append('\n')
+                      append("通知权限：").append(if (notify) "已开启" else "未开启").append('\n')
+                      append("API Key：").append(if (key) "已配置" else "未配置（仅题库可用）")
+                      append("\n\n")
+                      append(if (overlay && notify) "可以点第 ② 步启动了。" else "请先完成上面的权限开启。")
+                  }
+              }
+          
+              private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+          
+              private fun toast(message: String) {
+                  Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+              }
+          }
+          SQEOF_7
+          cat > app/src/main/java/com/example/screenqa/QaDb.kt <<'SQEOF_8'
+          package com.example.screenqa
+          
+          import android.content.Context
+          import android.database.sqlite.SQLiteDatabase
+          import android.database.sqlite.SQLiteOpenHelper
+          import java.text.Normalizer
+          
+          /**
+           * 本地题库：首次启动从 assets/qa.csv 导入 SQLite。
+           * 修改题库内容后，把 DB_VERSION 加 1 才会重新导入。
+           */
+          class QaDb(context: Context) :
+              SQLiteOpenHelper(context.applicationContext, DB_NAME, null, DB_VERSION) {
+          
+              private val appContext = context.applicationContext
+          
+              override fun onCreate(db: SQLiteDatabase) {
+                  db.execSQL(
+                      "CREATE TABLE qa (" +
+                          "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                          "question TEXT NOT NULL, " +
+                          "answer TEXT NOT NULL)"
+                  )
+                  runCatching {
+                      appContext.assets.open(CSV_FILE).bufferedReader(Charsets.UTF_8).use { reader ->
+                          reader.readLines()
+                              .drop(1) // 跳过表头
+                              .filter { it.isNotBlank() }
+                              .forEach { line ->
+                                  val row = parseCsvLine(line)
+                                  if (row.size >= 2 && row[0].isNotBlank()) {
+                                      db.execSQL(
+                                          "INSERT INTO qa(question, answer) VALUES(?,?)",
+                                          arrayOf(normalize(row[0]), row[1].trim())
+                                      )
+                                  }
+                              }
+                      }
+                  }
+              }
+          
+              /** 精确匹配 → 题库题目被 OCR 文本包含 → OCR 文本被题库题目包含 */
+              fun search(ocrText: String): String? {
+                  val q = normalize(ocrText)
+                  if (q.isEmpty()) return null
+                  val db = readableDatabase
+          
+                  db.rawQuery(
+                      "SELECT answer FROM qa WHERE question = ? LIMIT 1", arrayOf(q)
+                  ).use { c -> if (c.moveToFirst()) return c.getString(0) }
+          
+                  db.rawQuery(
+                      "SELECT answer FROM qa WHERE ? LIKE '%' || question || '%' " +
+                          "ORDER BY length(question) DESC LIMIT 1",
+                      arrayOf(q)
+                  ).use { c -> if (c.moveToFirst()) return c.getString(0) }
+          
+                  // 反向包含：OCR 文本太短时容易误命中，加一个长度下限
+                  if (q.length >= 4) {
+                      db.rawQuery(
+                          "SELECT answer FROM qa WHERE question LIKE ? ESCAPE '\\' " +
+                              "ORDER BY length(question) ASC LIMIT 1",
+                          arrayOf("%" + escapeLike(q) + "%")
+                      ).use { c -> if (c.moveToFirst()) return c.getString(0) }
+                  }
+                  return null
+              }
+          
+              private fun escapeLike(s: String): String =
+                  s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+          
+              /** 全角转半角、去空白与标点、转小写，抵消 OCR 的细微差异 */
+              private fun normalize(s: String): String =
+                  Normalizer.normalize(s, Normalizer.Form.NFKC)
+                      .lowercase()
+                      .replace(Regex("[\\s\\p{Punct}\\u3000-\\u303F\\uFF01-\\uFF65]"), "")
+          
+              /** 支持英文双引号包裹、字段内含逗号、两个连续双引号表示一个字面引号 */
+              private fun parseCsvLine(line: String): List<String> {
+                  val result = mutableListOf<String>()
+                  val field = StringBuilder()
+                  var quoted = false
+                  var i = 0
+                  while (i < line.length) {
+                      val ch = line[i]
+                      when {
+                          ch == '"' -> {
+                              if (quoted && i + 1 < line.length && line[i + 1] == '"') {
+                                  field.append('"')
+                                  i++
+                              } else {
+                                  quoted = !quoted
+                              }
+                          }
+                          ch == ',' && !quoted -> {
+                              result.add(field.toString())
+                              field.setLength(0)
+                          }
+                          else -> field.append(ch)
+                      }
+                      i++
+                  }
+                  result.add(field.toString())
+                  return result.map { it.trim().removePrefix("\uFEFF") }
+              }
+          
+              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+                  db.execSQL("DROP TABLE IF EXISTS qa")
+                  onCreate(db)
+              }
+          
+              companion object {
+                  private const val DB_NAME = "qa.db"
+                  private const val DB_VERSION = 1
+                  private const val CSV_FILE = "qa.csv"
+              }
+          }
+          SQEOF_8
+          cat > app/src/main/res/values/themes.xml <<'SQEOF_9'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.ScreenQA" parent="Theme.AppCompat.Light.NoActionBar">
+                  <item name="android:windowNoTitle">true</item>
+              </style>
+          </resources>
+          SQEOF_9
+          cat > build.gradle.kts <<'SQEOF_10'
+          // 根工程：只声明插件版本，不写仓库地址（统一由 settings.gradle.kts 管理）
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          SQEOF_10
+          cat > gradle.properties <<'SQEOF_11'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          SQEOF_11
+          cat > settings.gradle.kts <<'SQEOF_12'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          
+          rootProject.name = "ScreenQA"
+          include(":app")
+          SQEOF_12
+          echo "源码展开完成，共 $(find . -type f -not -path "./.git/*" | wc -l) 个文件"
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 安装 Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: 安装 Android SDK 命令行工具
+        uses: android-actions/setup-android@v3
+
+      - name: 接受许可并安装编译组件
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools" > /dev/null
+
+      - name: 编译 Debug APK（自动 debug 签名，手机可直接安装）
+        env:
+          # 可选：不配置也能用，Key 可以在手机上打开 App 自行填写
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if ! command -v gradle > /dev/null 2>&1; then
+            curl -fsSL https://services.gradle.org/distributions/gradle-8.9-bin.zip -o /tmp/gradle.zip
+            unzip -q /tmp/gradle.zip -d /tmp/gradle-dist
+            export PATH="/tmp/gradle-dist/gradle-8.9/bin:$PATH"
+          fi
+          gradle --version
+          gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: 整理产物
+        run: cp app/build/outputs/apk/debug/app-debug.apk ScreenQA.apk
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenQA-apk
+          path: ScreenQA.apk
+
+      # 关键：artifact 是 zip，手机不好解压；Release 挂的是裸 .apk，手机浏览器点开即可安装
+      - name: 发布可直接下载的 APK 直链
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ScreenQA 构建 #${{ github.run_number }}
+          files: ScreenQA.apk
+          body: 云端自动编译的 debug 签名 APK，Android 10+ 手机可直接下载安装。
