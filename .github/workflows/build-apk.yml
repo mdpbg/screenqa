@@ -876,15 +876,18 @@ jobs:
                           val maxH = (resources.displayMetrics.heightPixels * 0.45f).toInt()
                           super.onMeasure(
                               widthMeasureSpec,
-                              MeasureSpec.makeMeasureSpec(maxH, MeasureSpec.AT_MOST)
+                              View.MeasureSpec.makeMeasureSpec(maxH, View.MeasureSpec.AT_MOST)
                           )
                       }
                   }.apply {
                       addView(
                           resultText,
-                          ScrollView.LayoutParams(
-                              ScrollView.LayoutParams.MATCH_PARENT,
-                              ScrollView.LayoutParams.WRAP_CONTENT
+                          // ScrollView 本身没有声明 LayoutParams（它是 FrameLayout 的嵌套类，Kotlin 不能
+                          // 通过子类名访问父类嵌套类）；用 ViewGroup.LayoutParams，FrameLayout.addView
+                          // 会自动转换成自己的 LayoutParams，行为一致。
+                          ViewGroup.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT,
+                              ViewGroup.LayoutParams.WRAP_CONTENT
                           )
                       )
                   }
