@@ -1077,13 +1077,36 @@ jobs:
           # 可选：不配置也能用，Key 可以在手机上打开 App 自行填写
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
+          set -o pipefail
           if ! command -v gradle > /dev/null 2>&1; then
             curl -fsSL https://services.gradle.org/distributions/gradle-8.9-bin.zip -o /tmp/gradle.zip
             unzip -q /tmp/gradle.zip -d /tmp/gradle-dist
             export PATH="/tmp/gradle-dist/gradle-8.9/bin:$PATH"
           fi
           gradle --version
-          gradle :app:assembleDebug --no-daemon --stacktrace
+          # 不加 --stacktrace：几屏长的堆栈会把真正的错误信息挤出可视区域
+          set +e
+          gradle :app:assembleDebug --no-daemon 2>&1 | tee /tmp/gradle-build.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            cp /tmp/gradle-build.log gradle-build.log
+            echo "::group::===== 编译失败原因摘要（把这一段发我即可）====="
+            grep -nE "FAILURE:|What went wrong|^e: |Execution failed for task|Could not (resolve|find|get|download)|Caused by:|SDK location not found|Unresolved reference|error:|^> Task .*FAILED" /tmp/gradle-build.log | head -80 || true
+            echo "---- What went wrong 上下文 ----"
+            grep -n -A 8 "What went wrong" /tmp/gradle-build.log | head -30 || true
+            echo "::endgroup::"
+            echo "::error::编译失败，完整日志见 artifact：gradle-build-log"
+            exit "$RC"
+          fi
+
+      - name: 上传完整编译日志（仅失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: gradle-build.log
+          if-no-files-found: ignore
 
       - name: 整理产物
         run: cp app/build/outputs/apk/debug/app-debug.apk ScreenQA.apk
