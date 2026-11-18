@@ -1124,7 +1124,8 @@ jobs:
           
               /** 幂等：任何路径都可以调用，重复调用不会把流程提前解锁 */
               private fun finishFlow() {
-                  val task = {
+                  // 显式 () -> Unit：避免 if 分支的 runCatching(Result) 让 K2 推断成 () -> Any
+                  val task: () -> Unit = {
                       if (::captureButton.isInitialized && !destroyed) {
                           runCatching {
                               captureButton.isEnabled = true
@@ -1133,8 +1134,13 @@ jobs:
                       }
                       showFloatView()
                       capturing.set(false)
+                      Unit
                   }
-                  if (Looper.myLooper() == Looper.getMainLooper()) task() else mainHandler.post(task)
+                  if (Looper.myLooper() == Looper.getMainLooper()) {
+                      task()
+                  } else {
+                      mainHandler.post(Runnable { task() })
+                  }
               }
           
               /** 必须处理 rowStride / pixelStride，否则部分机型截出来的图是斜的；同时回收中间 bitmap */
@@ -1277,7 +1283,9 @@ jobs:
               // ---------------- 结果展示（答案蓝色加粗、解析灰色） ----------------
           
               private fun setResult(text: String) {
-                  val task = {
+                  // 显式 () -> Unit：if 分支末值是 onFailure 返回的 Result，else 分支是赋值，
+                  // 不显式声明会被 K2 推断成 () -> Any，导致 mainHandler.post 报类型不匹配。
+                  val task: () -> Unit = {
                       val cleaned = runCatching { TextCleaner.clean(text) }.getOrDefault(text)
                       if (::resultText.isInitialized) {
                           runCatching { resultText.text = styleText(cleaned) }
@@ -1285,8 +1293,13 @@ jobs:
                       } else {
                           pendingResult = cleaned
                       }
+                      Unit
                   }
-                  if (Looper.myLooper() == Looper.getMainLooper()) task() else mainHandler.post(task)
+                  if (Looper.myLooper() == Looper.getMainLooper()) {
+                      task()
+                  } else {
+                      mainHandler.post(Runnable { task() })
+                  }
               }
           
               private fun styleText(text: String): CharSequence {
