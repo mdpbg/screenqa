@@ -60,8 +60,9 @@ jobs:
                   applicationId = "com.example.screenqa"
                   minSdk = 29              // Android 10+
                   targetSdk = 35
-                  versionCode = 1
-                  versionName = "1.0"
+                  multiDexEnabled = true  // PDFBox 类较多；minSdk>=21 原生支持，无需 multidex 依赖库
+                  versionCode = 2
+                  versionName = "2.0"
                   buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekKey\"")
               }
           
@@ -91,6 +92,13 @@ jobs:
               // compileSdk=35，会在 :app:checkDebugAarMetadata 直接失败（实测 5.5.0 报 "requires ... version 37"）。
               // 5.3.2 的 minCompileSdk=1，兼容，且 API 与 5.5 一致（toMediaType/toRequestBody 均可用）。
               implementation("com.squareup.okhttp3:okhttp:5.3.2")
+          
+              // PDF 题库解析：纯 Java 库，minCompileSdk=1，无 Kotlin 元数据风险（已实测 AAR 元数据）。
+              // 排除 BouncyCastle：Android 系统自带精简版 BC，打包完整 BC 会冲突；
+              // 文字提取不需要它（仅加密/签名 PDF 需要），排除后加密 PDF 将解析失败，属可接受取舍。
+              implementation("com.tom-roush:pdfbox-android:2.0.27.0") {
+                  exclude(group = "org.bouncycastle")
+              }
           
               // 注意：org.json 由 Android 平台自带，不需要额外依赖，加了反而容易 duplicate class
           }
@@ -201,7 +209,7 @@ jobs:
           
                   // 用 JSONObject 构造请求体，避免手工拼接 JSON 时的转义问题
                   val requestBody = JSONObject().apply {
-                      put("model", "deepseek-chat")
+                      put("model", "deepseek-v4-flash") // 旧名 deepseek-chat 已于 2026-07 停用，v4-flash 是其对应型号
                       put("temperature", 0)
                       put("messages", JSONArray().apply {
                           put(JSONObject().apply {
@@ -251,7 +259,324 @@ jobs:
               }
           }
           SQEOF_5
-          cat > app/src/main/java/com/example/screenqa/FloatService.kt <<'SQEOF_6'
+          cat > app/src/main/java/com/example/screenqa/BankImporter.kt <<'SQEOF_6'
+          package com.example.screenqa
+          
+          import android.content.Context
+          import android.net.Uri
+          import android.util.Xml
+          import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+          import com.tom_roush.pdfbox.pdmodel.PDDocument
+          import com.tom_roush.pdfbox.text.PDFTextStripper
+          import org.xmlpull.v1.XmlPullParser
+          import java.util.zip.ZipInputStream
+          
+          /**
+           * 题库文件解析器。支持格式：
+           *  - txt / csv / tsv：每行一题，"题目,答案"（英文逗号 / 制表符 / 中文逗号分隔，支持引号包裹）
+           *  - xlsx：第一个工作表，A 列题目、B 列答案
+           *  - docx：每段一行，再按上面的分隔规则解析
+           *  - pptx：按页提取文字段落，每段一行，再按分隔规则解析
+           *  - pdf ：提取文字后每行按分隔规则解析（要求"题目,答案"在同一行；加密 PDF 不支持）
+           *
+           * 解析原则：docx/pptx/xlsx 本质是 zip+XML，用系统自带 XmlPullParser 解，不引入 Apache POI
+           * （POI 在 Android 上体积大且有兼容性问题）。PDF 无内建方案，用 pdfbox-android。
+           */
+          object BankImporter {
+          
+              /** pairs=解析出的题目；skipped=无法解析的行数；error=整体失败原因（非空时 pairs 无效） */
+              data class Result(
+                  val pairs: List<Pair<String, String>>,
+                  val skipped: Int,
+                  val error: String? = null
+              )
+          
+              fun import(context: Context, uri: Uri, ext: String): Result {
+                  val bytes = try {
+                      context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                  } catch (e: Exception) {
+                      return Result(emptyList(), 0, "读取文件失败：${e.message}")
+                  } ?: return Result(emptyList(), 0, "无法读取文件")
+                  if (bytes.isEmpty()) return Result(emptyList(), 0, "文件为空")
+          
+                  return try {
+                      when (ext) {
+                          "txt", "csv", "tsv" -> parseLines(decodeText(bytes).lines())
+                          "xlsx" -> importXlsx(bytes)
+                          "docx" -> parseLines(extractDocxLines(bytes))
+                          "pptx" -> parseLines(extractPptxLines(bytes))
+                          "pdf" -> parseLines(extractPdfLines(context, bytes))
+                          else -> Result(emptyList(), 0, "不支持的格式：.$ext")
+                      }
+                  } catch (e: Exception) {
+                      Result(emptyList(), 0, "解析失败：${e.javaClass.simpleName}：${e.message}")
+                  }
+              }
+          
+              // ---------------- 文本行解析 ----------------
+          
+              /** 把若干行文本解析成 题目/答案 对 */
+              fun parseLines(lines: List<String>): Result {
+                  val pairs = mutableListOf<Pair<String, String>>()
+                  var skipped = 0
+                  lines.forEachIndexed { index, raw ->
+                      val line = raw.trim().removePrefix("\uFEFF").trim()
+                      if (line.isEmpty()) return@forEachIndexed
+                      val qa = splitQA(line)
+                      if (qa == null) {
+                          skipped++
+                          return@forEachIndexed
+                      }
+                      val q = qa.first.trim()
+                      val a = qa.second.trim()
+                      // 跳过常见表头
+                      if (index == 0 && (q.equals("question", true) || q == "题目" || q == "问题")) {
+                          return@forEachIndexed
+                      }
+                      if (q.isEmpty() || a.isEmpty()) {
+                          skipped++
+                          return@forEachIndexed
+                      }
+                      pairs += q to a
+                  }
+                  return Result(pairs, skipped)
+              }
+          
+              /** 一行文本 → 题目/答案。依次尝试：制表符 → 英文逗号(CSV规则) → 中文逗号 */
+              fun splitQA(line: String): Pair<String, String>? {
+                  val tab = line.indexOf('\t')
+                  if (tab > 0) return line.substring(0, tab) to line.substring(tab + 1)
+          
+                  val cells = splitCsv(line)
+                  if (cells.size >= 2 && cells[0].isNotBlank()) {
+                      return cells[0] to cells.drop(1).joinToString(",")
+                  }
+          
+                  val cn = line.indexOf('，')
+                  if (cn > 0) return line.substring(0, cn) to line.substring(cn + 1)
+          
+                  return null
+              }
+          
+              /** CSV 切分：支持双引号包裹、字段内逗号、"" 表示字面引号 */
+              private fun splitCsv(line: String): List<String> {
+                  val out = mutableListOf<String>()
+                  val sb = StringBuilder()
+                  var inQuotes = false
+                  var i = 0
+                  while (i < line.length) {
+                      val ch = line[i]
+                      when {
+                          inQuotes -> when {
+                              ch == '"' && i + 1 < line.length && line[i + 1] == '"' -> {
+                                  sb.append('"'); i++
+                              }
+                              ch == '"' -> inQuotes = false
+                              else -> sb.append(ch)
+                          }
+                          ch == '"' && sb.isEmpty() -> inQuotes = true
+                          ch == ',' -> {
+                              out += sb.toString(); sb.setLength(0)
+                          }
+                          else -> sb.append(ch)
+                      }
+                      i++
+                  }
+                  out += sb.toString()
+                  return out
+              }
+          
+              /** UTF-8 解码；出现替换字符说明是 GBK/ANSI 保存的中文文本，退回 GBK 重解 */
+              private fun decodeText(bytes: ByteArray): String {
+                  val utf8 = String(bytes, Charsets.UTF_8)
+                  return if (utf8.contains('\uFFFD')) String(bytes, charset("GBK")) else utf8
+              }
+          
+              // ---------------- zip/XML 系（docx / pptx / xlsx） ----------------
+          
+              private fun unzip(bytes: ByteArray): Map<String, ByteArray> {
+                  val map = LinkedHashMap<String, ByteArray>()
+                  ZipInputStream(bytes.inputStream()).use { zis ->
+                      var entry = zis.nextEntry
+                      while (entry != null) {
+                          if (!entry.isDirectory) map[entry.name] = zis.readBytes()
+                          zis.closeEntry()
+                          entry = zis.nextEntry
+                      }
+                  }
+                  return map
+              }
+          
+              /** 去掉命名空间前缀："w:t" → "t"，"a:p" → "p" */
+              private fun local(name: String): String = name.substringAfter(':')
+          
+              /**
+               * 抽取段落文本：把 <*:p> 视为段落边界、<*:t> 为文字、<*:tab>/<*:br> 为分隔。
+               * docx 的 w:p/w:t 和 pptx 的 a:p/a:t 都满足这个模式，可共用。
+               */
+              private fun extractParagraphLines(xml: ByteArray): List<String> {
+                  val lines = mutableListOf<String>()
+                  val parser = Xml.newPullParser()
+                  parser.setInput(xml.inputStream(), "UTF-8")
+                  val sb = StringBuilder()
+                  var inPara = false
+                  var event = parser.eventType
+                  while (event != XmlPullParser.END_DOCUMENT) {
+                      when (event) {
+                          XmlPullParser.START_TAG -> when (local(parser.name)) {
+                              "p" -> {
+                                  inPara = true; sb.setLength(0)
+                              }
+                              "t" -> if (inPara) sb.append(parser.nextText())
+                              "tab" -> if (inPara) sb.append('\t')
+                              "br" -> if (inPara) sb.append('\n')
+                          }
+                          XmlPullParser.END_TAG ->
+                              if (local(parser.name) == "p" && inPara) {
+                                  lines += sb.toString(); inPara = false
+                              }
+                      }
+                      event = parser.next()
+                  }
+                  return lines
+              }
+          
+              private fun extractDocxLines(bytes: ByteArray): List<String> {
+                  val entries = unzip(bytes)
+                  val doc = entries["word/document.xml"]
+                      ?: throw IllegalArgumentException("不是有效的 docx（缺少 word/document.xml）")
+                  return extractParagraphLines(doc)
+              }
+          
+              private fun extractPptxLines(bytes: ByteArray): List<String> {
+                  val entries = unzip(bytes)
+                  val slideNames = entries.keys
+                      .filter { Regex("ppt/slides/slide\\d+\\.xml").matches(it) }
+                      .sortedBy { Regex("\\d+").find(it)!!.value.toInt() }
+                  if (slideNames.isEmpty()) throw IllegalArgumentException("pptx 中找不到幻灯片")
+                  return slideNames.flatMap { extractParagraphLines(entries.getValue(it)) }
+              }
+          
+              /** xlsx：A 列题目、B 列答案（第一个工作表） */
+              private fun importXlsx(bytes: ByteArray): Result {
+                  val entries = unzip(bytes)
+                  val shared = parseSharedStrings(entries["xl/sharedStrings.xml"])
+                  val sheetName = entries.keys
+                      .filter { Regex("xl/worksheets/sheet\\d+\\.xml").matches(it) }
+                      .sortedBy { Regex("\\d+").find(it)!!.value.toInt() }
+                      .firstOrNull()
+                      ?: return Result(emptyList(), 0, "xlsx 中找不到工作表")
+                  val rows = parseSheet(entries.getValue(sheetName), shared)
+          
+                  val pairs = mutableListOf<Pair<String, String>>()
+                  var skipped = 0
+                  rows.forEachIndexed { index, row ->
+                      val q = row["A"]?.trim().orEmpty()
+                      val a = row["B"]?.trim().orEmpty()
+                      if (q.isEmpty() && a.isEmpty()) return@forEachIndexed
+                      if (index == 0 && (q.equals("question", true) || q == "题目" || q == "问题")) {
+                          return@forEachIndexed
+                      }
+                      if (q.isEmpty() || a.isEmpty()) {
+                          skipped++
+                          return@forEachIndexed
+                      }
+                      pairs += q to a
+                  }
+                  return Result(pairs, skipped)
+              }
+          
+              /** 解析 xl/sharedStrings.xml：每个 <si> 的所有 <t> 拼接成一个字符串 */
+              private fun parseSharedStrings(xml: ByteArray?): List<String> {
+                  if (xml == null) return emptyList()
+                  val list = mutableListOf<String>()
+                  val parser = Xml.newPullParser()
+                  parser.setInput(xml.inputStream(), "UTF-8")
+                  val sb = StringBuilder()
+                  var inSi = false
+                  var event = parser.eventType
+                  while (event != XmlPullParser.END_DOCUMENT) {
+                      when (event) {
+                          XmlPullParser.START_TAG -> when (local(parser.name)) {
+                              "si" -> {
+                                  inSi = true; sb.setLength(0)
+                              }
+                              "t" -> if (inSi) sb.append(parser.nextText())
+                          }
+                          XmlPullParser.END_TAG -> if (local(parser.name) == "si") {
+                              list += sb.toString(); inSi = false
+                          }
+                      }
+                      event = parser.next()
+                  }
+                  return list
+              }
+          
+              /** 解析工作表：返回 行列表，每行是 列字母→文本 的映射 */
+              private fun parseSheet(xml: ByteArray, shared: List<String>): List<Map<String, String>> {
+                  val rows = mutableListOf<Map<String, String>>()
+                  var currentRow: MutableMap<String, String>? = null
+                  var cellCol: String? = null
+                  var cellType: String? = null
+                  var inValue = false
+                  val sb = StringBuilder()
+                  val parser = Xml.newPullParser()
+                  parser.setInput(xml.inputStream(), "UTF-8")
+                  var event = parser.eventType
+                  while (event != XmlPullParser.END_DOCUMENT) {
+                      when (event) {
+                          XmlPullParser.START_TAG -> when (local(parser.name)) {
+                              "row" -> currentRow = mutableMapOf()
+                              "c" -> {
+                                  val ref = parser.getAttributeValue(null, "r") ?: ""
+                                  cellCol = ref.takeWhile { it.isLetter() }
+                                  cellType = parser.getAttributeValue(null, "t")
+                                  sb.setLength(0)
+                              }
+                              "v", "t" -> inValue = true
+                          }
+                          XmlPullParser.TEXT -> if (inValue) sb.append(parser.text)
+                          XmlPullParser.END_TAG -> when (local(parser.name)) {
+                              "v", "t" -> inValue = false
+                              "c" -> {
+                                  val col = cellCol
+                                  val row = currentRow
+                                  if (col != null && row != null) {
+                                      val raw = sb.toString()
+                                      val value = when (cellType) {
+                                          // 共享字符串索引
+                                          "s" -> raw.toIntOrNull()?.let { shared.getOrNull(it) } ?: ""
+                                          else -> raw
+                                      }
+                                      if (value.isNotEmpty()) row[col] = value
+                                  }
+                                  cellCol = null; cellType = null
+                              }
+                              "row" -> {
+                                  currentRow?.let { rows += it }
+                                  currentRow = null
+                              }
+                          }
+                      }
+                      event = parser.next()
+                  }
+                  return rows
+              }
+          
+              // ---------------- PDF ----------------
+          
+              private fun extractPdfLines(context: Context, bytes: ByteArray): List<String> {
+                  PDFBoxResourceLoader.init(context.applicationContext)
+                  val doc = PDDocument.load(bytes)
+                  return try {
+                      PDFTextStripper().getText(doc).lines()
+                  } finally {
+                      doc.close()
+                  }
+              }
+          }
+          SQEOF_6
+          cat > app/src/main/java/com/example/screenqa/FloatService.kt <<'SQEOF_7'
           package com.example.screenqa
           
           import android.app.Activity
@@ -648,8 +973,8 @@ jobs:
                   private const val NOTIFICATION_ID = 1
               }
           }
-          SQEOF_6
-          cat > app/src/main/java/com/example/screenqa/MainActivity.kt <<'SQEOF_7'
+          SQEOF_7
+          cat > app/src/main/java/com/example/screenqa/MainActivity.kt <<'SQEOF_8'
           package com.example.screenqa
           
           import android.Manifest
@@ -660,23 +985,32 @@ jobs:
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
+          import android.provider.OpenableColumns
           import android.provider.Settings
           import android.text.InputType
           import android.view.ViewGroup
           import android.widget.Button
           import android.widget.EditText
           import android.widget.LinearLayout
+          import android.widget.ScrollView
           import android.widget.TextView
           import android.widget.Toast
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.appcompat.app.AppCompatActivity
           import androidx.core.content.ContextCompat
+          import kotlin.concurrent.thread
           
           class MainActivity : AppCompatActivity() {
           
+              private lateinit var db: QaDb
               private lateinit var statusText: TextView
+              private lateinit var bankCountText: TextView
+              private lateinit var importResultText: TextView
               private lateinit var keyInput: EditText
               private lateinit var projectionManager: MediaProjectionManager
+          
+              @Volatile
+              private var importing = false
           
               private val notificationPermission =
                   registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -702,9 +1036,16 @@ jobs:
                       }
                   }
           
+              // 文件选择器：mime 用 */* 保证所有文件可见，按扩展名自行判断
+              private val pickFile =
+                  registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                      if (uri != null) importFile(uri)
+                  }
+          
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  db = QaDb(this)
                   buildUi()
                   requestNotificationPermissionIfNeeded()
                   refreshStatus()
@@ -715,15 +1056,23 @@ jobs:
                   refreshStatus()
               }
           
+              // ---------------- 界面 ----------------
+          
               private fun buildUi() {
                   fun lp() = LinearLayout.LayoutParams(
                       ViewGroup.LayoutParams.MATCH_PARENT,
                       ViewGroup.LayoutParams.WRAP_CONTENT
                   ).apply { topMargin = dp(12) }
           
+                  fun sectionTitle(text: String) = TextView(this).apply {
+                      this.text = text
+                      textSize = 16f
+                      setTypeface(null, Typeface.BOLD)
+                  }
+          
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setPadding(dp(24), dp(32), dp(24), dp(24))
+                      setPadding(dp(24), dp(28), dp(24), dp(32))
                   }
           
                   val title = TextView(this).apply {
@@ -735,10 +1084,8 @@ jobs:
                       text = "截屏 → OCR 识别题目 → 先查本地题库 → 未命中再问 AI。\n建议用于课后练习自测。"
                       textSize = 13f
                   }
-                  statusText = TextView(this).apply {
-                      textSize = 14f
-                      setPadding(0, dp(12), 0, dp(12))
-                  }
+                  statusText = TextView(this).apply { textSize = 14f }
+          
                   val overlayButton = Button(this).apply {
                       text = "① 开启悬浮窗权限"
                       setOnClickListener { openOverlaySettings() }
@@ -755,12 +1102,31 @@ jobs:
                           refreshStatus()
                       }
                   }
-                  val keyTitle = TextView(this).apply {
-                      text = "DeepSeek API Key（可选，仅 AI 兜底需要）"
-                      textSize = 13f
+          
+                  // ---- 题库管理 ----
+                  val bankTitle = sectionTitle("题库管理")
+                  bankCountText = TextView(this).apply { textSize = 14f }
+                  val importButton = Button(this).apply {
+                      text = "导入题库文件（txt / csv / xlsx / docx / pptx / pdf）"
+                      setOnClickListener { pickFile.launch(arrayOf("*/*")) }
                   }
+                  val clearButton = Button(this).apply {
+                      text = "清空题库"
+                      setOnClickListener {
+                          db.clearAll()
+                          toast("题库已清空")
+                          refreshStatus()
+                      }
+                  }
+                  importResultText = TextView(this).apply {
+                      textSize = 13f
+                      text = "支持格式与规则见页面底部说明。"
+                  }
+          
+                  // ---- API Key ----
+                  val keyTitle = sectionTitle("DeepSeek API Key（可选）")
                   keyInput = EditText(this).apply {
-                      hint = "sk-... 填写后点保存，只保存在本机 App 内"
+                      hint = "sk-... 仅 AI 兜底需要，只保存在本机"
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                       setText(AiClient.readKey(this@MainActivity))
                   }
@@ -772,10 +1138,21 @@ jobs:
                           refreshStatus()
                       }
                   }
-                  val tip = TextView(this).apply {
-                      text = "用法：授权后切到其他 App，点悬浮窗上的「识别当前屏幕」。\n" +
-                          "修改 assets/qa.csv 后，需把 QaDb 里的 DB_VERSION 加 1 才会重新导入。"
+          
+                  // ---- 使用说明 ----
+                  val helpTitle = sectionTitle("使用说明")
+                  val help = TextView(this).apply {
                       textSize = 12f
+                      text = """
+                          1. 完成 ① 权限后点 ② 启动悬浮窗，切到题目页面点「识别当前屏幕」。
+                          2. 导入题库的文件内容规则：
+                             · txt / csv：每行一题，题目和答案用英文逗号、制表符或中文逗号分隔，例如「中国的首都,北京」；含逗号的字段用英文双引号包裹。
+                             · xlsx：第一个工作表，A 列题目、B 列答案。
+                             · docx / pptx / pdf：每段（每行）一题，同样用逗号或制表符分隔题目和答案。
+                             · 第一行是「question,answer」或「题目,答案」表头时会自动跳过；同一题目重复导入会覆盖旧答案。
+                          3. 题库命中不消耗任何费用；未命中才会调用 AI（需 Key 且按量计费）。
+                          4. 手机重启或 App 被杀后屏幕捕获授权会失效，重开 App 再点一次 ② 即可。
+                      """.trimIndent()
                   }
           
                   root.addView(title, lp())
@@ -784,12 +1161,60 @@ jobs:
                   root.addView(overlayButton, lp())
                   root.addView(startButton, lp())
                   root.addView(stopButton, lp())
+                  root.addView(bankTitle, lp())
+                  root.addView(bankCountText, lp())
+                  root.addView(importButton, lp())
+                  root.addView(clearButton, lp())
+                  root.addView(importResultText, lp())
                   root.addView(keyTitle, lp())
                   root.addView(keyInput, lp())
                   root.addView(saveKeyButton, lp())
-                  root.addView(tip, lp())
-                  setContentView(root)
+                  root.addView(helpTitle, lp())
+                  root.addView(help, lp())
+          
+                  val scroll = ScrollView(this).apply { addView(root) }
+                  setContentView(scroll)
               }
+          
+              // ---------------- 导入 ----------------
+          
+              private fun importFile(uri: Uri) {
+                  if (importing) {
+                      toast("正在导入中，请稍候")
+                      return
+                  }
+                  val name = queryDisplayName(uri) ?: "未知文件"
+                  val ext = name.substringAfterLast('.', "").lowercase()
+                  val supported = listOf("txt", "csv", "tsv", "xlsx", "docx", "pptx", "pdf")
+                  if (ext !in supported) {
+                      importResultText.text = "不支持的格式：.$ext\n支持：${supported.joinToString(" / ")}"
+                      return
+                  }
+                  importing = true
+                  importResultText.text = "正在导入 $name ..."
+                  thread {
+                      val result = BankImporter.import(this, uri, ext)
+                      val added = if (result.error == null) db.insertBatch(result.pairs) else 0
+                      runOnUiThread {
+                          importing = false
+                          importResultText.text = if (result.error != null) {
+                              "导入失败：${result.error}"
+                          } else {
+                              "导入完成：成功 $added 条，跳过 ${result.skipped} 条（空行/格式不符/表头）"
+                          }
+                          refreshStatus()
+                      }
+                  }
+              }
+          
+              private fun queryDisplayName(uri: Uri): String? = runCatching {
+                  contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                      if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+                  }
+              }.getOrNull()
+          
+              // ---------------- 权限与启动 ----------------
           
               private fun startCapture() {
                   if (!Settings.canDrawOverlays(this)) {
@@ -833,9 +1258,10 @@ jobs:
                       append("悬浮窗权限：").append(if (overlay) "已开启" else "未开启").append('\n')
                       append("通知权限：").append(if (notify) "已开启" else "未开启").append('\n')
                       append("API Key：").append(if (key) "已配置" else "未配置（仅题库可用）")
-                      append("\n\n")
+                      append("\n")
                       append(if (overlay && notify) "可以点第 ② 步启动了。" else "请先完成上面的权限开启。")
                   }
+                  bankCountText.text = "当前题库：${db.count()} 条"
               }
           
               private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -844,8 +1270,8 @@ jobs:
                   Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
               }
           }
-          SQEOF_7
-          cat > app/src/main/java/com/example/screenqa/QaDb.kt <<'SQEOF_8'
+          SQEOF_8
+          cat > app/src/main/java/com/example/screenqa/QaDb.kt <<'SQEOF_9'
           package com.example.screenqa
           
           import android.content.Context
@@ -854,8 +1280,9 @@ jobs:
           import java.text.Normalizer
           
           /**
-           * 本地题库：首次启动从 assets/qa.csv 导入 SQLite。
-           * 修改题库内容后，把 DB_VERSION 加 1 才会重新导入。
+           * 本地题库：首次启动从 assets/qa.csv 导入示例题库。
+           * 之后用户在 App 内导入的文件通过 insertBatch() 追加/覆盖，无需重新编译或改版本号。
+           * DB_VERSION 仅在表结构变更时才需要递增。
            */
           class QaDb(context: Context) :
               SQLiteOpenHelper(context.applicationContext, DB_NAME, null, DB_VERSION) {
@@ -952,6 +1379,40 @@ jobs:
                   return result.map { it.trim().removePrefix("\uFEFF") }
               }
           
+              /** 批量导入：按归一化后的题目去重（同题新答案覆盖旧答案），返回写入条数 */
+              fun insertBatch(pairs: List<Pair<String, String>>): Int {
+                  if (pairs.isEmpty()) return 0
+                  val db = writableDatabase
+                  var count = 0
+                  db.beginTransaction()
+                  try {
+                      pairs.forEach { (q, a) ->
+                          val nq = normalize(q)
+                          if (nq.isNotEmpty() && a.isNotBlank()) {
+                              db.execSQL("DELETE FROM qa WHERE question = ?", arrayOf(nq))
+                              db.execSQL(
+                                  "INSERT INTO qa(question, answer) VALUES(?,?)",
+                                  arrayOf(nq, a.trim())
+                              )
+                              count++
+                          }
+                      }
+                      db.setTransactionSuccessful()
+                  } finally {
+                      db.endTransaction()
+                  }
+                  return count
+              }
+          
+              fun clearAll() {
+                  writableDatabase.execSQL("DELETE FROM qa")
+              }
+          
+              fun count(): Int =
+                  readableDatabase.rawQuery("SELECT COUNT(*) FROM qa", null).use { c ->
+                      if (c.moveToFirst()) c.getInt(0) else 0
+                  }
+          
               override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
                   db.execSQL("DROP TABLE IF EXISTS qa")
                   onCreate(db)
@@ -963,30 +1424,30 @@ jobs:
                   private const val CSV_FILE = "qa.csv"
               }
           }
-          SQEOF_8
-          cat > app/src/main/res/values/themes.xml <<'SQEOF_9'
+          SQEOF_9
+          cat > app/src/main/res/values/themes.xml <<'SQEOF_10'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <style name="Theme.ScreenQA" parent="Theme.AppCompat.Light.NoActionBar">
                   <item name="android:windowNoTitle">true</item>
               </style>
           </resources>
-          SQEOF_9
-          cat > build.gradle.kts <<'SQEOF_10'
+          SQEOF_10
+          cat > build.gradle.kts <<'SQEOF_11'
           // 根工程：只声明插件版本，不写仓库地址（统一由 settings.gradle.kts 管理）
           plugins {
               id("com.android.application") version "8.7.3" apply false
               id("org.jetbrains.kotlin.android") version "2.2.21" apply false
           }
-          SQEOF_10
-          cat > gradle.properties <<'SQEOF_11'
+          SQEOF_11
+          cat > gradle.properties <<'SQEOF_12'
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           org.gradle.parallel=true
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           kotlin.code.style=official
-          SQEOF_11
-          cat > settings.gradle.kts <<'SQEOF_12'
+          SQEOF_12
+          cat > settings.gradle.kts <<'SQEOF_13'
           pluginManagement {
               repositories {
                   google()
@@ -1005,7 +1466,7 @@ jobs:
           
           rootProject.name = "ScreenQA"
           include(":app")
-          SQEOF_12
+          SQEOF_13
           echo "源码展开完成，共 $(find . -type f -not -path "./.git/*" | wc -l) 个文件"
 
       - name: 安装 JDK 17
