@@ -61,8 +61,8 @@ jobs:
                   minSdk = 29              // Android 10+
                   targetSdk = 35
                   multiDexEnabled = true  // PDFBox 类较多；minSdk>=21 原生支持，无需 multidex 依赖库
-                  versionCode = 2
-                  versionName = "2.0"
+                  versionCode = 3
+                  versionName = "2.1"
                   buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekKey\"")
               }
           
@@ -116,6 +116,7 @@ jobs:
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
           
               <application
+                  android:name=".QaApp"
                   android:allowBackup="false"
                   android:icon="@android:drawable/ic_menu_search"
                   android:label="屏幕答题助手"
@@ -125,6 +126,7 @@ jobs:
           
                   <activity
                       android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|density"
                       android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
@@ -214,7 +216,13 @@ jobs:
                       put("messages", JSONArray().apply {
                           put(JSONObject().apply {
                               put("role", "system")
-                              put("content", "你是答题助手，用于课后练习自测。只给最终答案，以及不超过两行的简要解析。")
+                              put(
+                                  "content",
+                                  "你是答题助手，用于课后练习自测。严格分两部分回答：" +
+                                      "第一行以「【答案】」开头给出最终答案（选择题给选项字母+内容，填空/简答给完整结果）；" +
+                                      "换行后以「【解析】」开头给出简明但完整的解析（3-5 行，说明关键步骤或依据）。" +
+                                      "不要使用 Markdown 加粗/标题/代码块符号，不要输出客套话。"
+                              )
                           })
                           put(JSONObject().apply {
                               put("role", "user")
@@ -236,20 +244,22 @@ jobs:
           
                       override fun onResponse(call: Call, response: Response) {
                           response.use { resp ->
-                              val body = resp.body?.string().orEmpty()
+                              // 显式按 UTF-8 解码，避免依赖响应头 charset 缺失时的乱码
+                              val body = resp.body?.bytes()?.let { String(it, Charsets.UTF_8) }.orEmpty()
                               val answer = if (!resp.isSuccessful) {
-                                  "AI 接口 HTTP ${resp.code}：${body.take(200)}"
+                                  "AI 接口 HTTP ${resp.code}：${TextCleaner.clean(body).take(200)}"
                               } else {
                                   try {
-                                      JSONObject(body)
+                                      val content = JSONObject(body)
                                           .getJSONArray("choices")
                                           .getJSONObject(0)
                                           .getJSONObject("message")
                                           .getString("content")
-                                          .trim()
+                                      // 清洗 BOM/零宽字符/Markdown 符号，保留【答案】【解析】结构
+                                      TextCleaner.cleanAnswer(content)
                                           .ifEmpty { "AI 返回空内容" }
                                   } catch (e: Exception) {
-                                      "解析失败：${body.take(200)}"
+                                      "解析失败：${TextCleaner.clean(body).take(200)}"
                                   }
                               }
                               callback(answer)
@@ -294,23 +304,36 @@ jobs:
               fun import(context: Context, uri: Uri, ext: String): Result {
                   val bytes = try {
                       context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                  } catch (e: Exception) {
-                      return Result(emptyList(), 0, "读取文件失败：${e.message}")
+                  } catch (t: Throwable) {
+                      return Result(emptyList(), 0, friendlyError(t))
                   } ?: return Result(emptyList(), 0, "无法读取文件")
                   if (bytes.isEmpty()) return Result(emptyList(), 0, "文件为空")
+                  // 防 OOM：整个文件会读进内存，超大文件直接拒绝
+                  if (bytes.size > MAX_FILE_BYTES) {
+                      return Result(emptyList(), 0, "文件过大（${bytes.size / 1048576}MB），请拆分后导入（上限 ${MAX_FILE_BYTES / 1048576}MB）")
+                  }
           
                   return try {
                       when (ext) {
                           "txt", "csv", "tsv" -> parseLines(decodeText(bytes).lines())
                           "xlsx" -> importXlsx(bytes)
-                          "docx" -> parseLines(extractDocxLines(bytes))
-                          "pptx" -> parseLines(extractPptxLines(bytes))
-                          "pdf" -> parseLines(extractPdfLines(context, bytes))
+                          // 文档类必须走段落解析：自动识别【编程题】/【程序运行示例】/【答案】等
+                          // 结构化标记并把跨段落的题目与答案配对；没有这些标记时会自动回落到
+                          // 旧的「题目,答案」逐行解析，保证两种题库格式都能用。
+                          "docx" -> parseParagraphs(extractDocxLines(bytes))
+                          "pptx" -> parseParagraphs(extractPptxLines(bytes))
+                          "pdf" -> parseParagraphs(extractPdfLines(context, bytes))
                           else -> Result(emptyList(), 0, "不支持的格式：.$ext")
                       }
-                  } catch (e: Exception) {
-                      Result(emptyList(), 0, "解析失败：${e.javaClass.simpleName}：${e.message}")
+                  } catch (t: Throwable) {
+                      // 捕获 Throwable 而非 Exception：OOM 等 Error 也要兜住，避免导入时闪退
+                      Result(emptyList(), 0, friendlyError(t))
                   }
+              }
+          
+              private fun friendlyError(t: Throwable): String = when (t) {
+                  is OutOfMemoryError -> "内存不足（文件太大或内容太多），请拆分文件后再导入"
+                  else -> "解析失败：${t.javaClass.simpleName}：${t.message ?: "未知原因"}"
               }
           
               // ---------------- 文本行解析 ----------------
@@ -320,7 +343,7 @@ jobs:
                   val pairs = mutableListOf<Pair<String, String>>()
                   var skipped = 0
                   lines.forEachIndexed { index, raw ->
-                      val line = raw.trim().removePrefix("\uFEFF").trim()
+                      val line = TextCleaner.clean(raw).trim()
                       if (line.isEmpty()) return@forEachIndexed
                       val qa = splitQA(line)
                       if (qa == null) {
@@ -390,6 +413,70 @@ jobs:
               private fun decodeText(bytes: ByteArray): String {
                   val utf8 = String(bytes, Charsets.UTF_8)
                   return if (utf8.contains('\uFFFD')) String(bytes, charset("GBK")) else utf8
+              }
+          
+              // ---------------- 结构化题库解析（【编程题】/【答案】等标记） ----------------
+          
+              // 答案/解析段标记：【答案】【解析】【程序运行示例】【参考答案】或"答案：""解析："开头
+              private val ANSWER_MARK =
+                  Regex("【[^】]*(答案|解析|运行示例)[^】]*】|^(答案|解析|参考答案)\\s*[:：]")
+              // 题目段标记：【编程题】【改错题】【单选题】等含"题"；或【编程示例】（不含"运行"，避免与运行示例冲突）
+              private val QUESTION_MARK =
+                  Regex("【[^】]*题[^】]*】|【(?![^】]*运行)[^】]*示例[^】]*】")
+          
+              /** 统一入口：含结构化标记用段落状态机，否则用"题目,答案"简单格式 */
+              fun parseParagraphs(lines: List<String>): Result {
+                  val cleaned = lines.map { TextCleaner.clean(it).trim() }
+                  val structured = cleaned.any {
+                      QUESTION_MARK.containsMatchIn(it) || ANSWER_MARK.containsMatchIn(it)
+                  }
+                  return if (structured) parseStructured(cleaned) else parseLines(cleaned)
+              }
+          
+              /**
+               * 段落状态机：识别"【题型】题目"段与"【答案/解析/运行示例】"段，
+               * 题目可跨多段、答案可跨多段，读到下一题时结算上一题。
+               * 实测对《实训报告-设计模块化程序》这类结构化题库能正确配对 7 题。
+               */
+              private fun parseStructured(lines: List<String>): Result {
+                  val pairs = mutableListOf<Pair<String, String>>()
+                  val q = StringBuilder()
+                  val a = StringBuilder()
+                  var inAnswer = false
+                  var hasQuestion = false
+          
+                  fun flush() {
+                      val qt = q.toString().trim()
+                      val at = a.toString().trim()
+                      if (qt.isNotEmpty() && at.isNotEmpty()) pairs += qt to at
+                      q.clear(); a.clear(); inAnswer = false
+                  }
+          
+                  for (raw in lines) {
+                      val line = raw.trim()
+                      if (line.isEmpty()) continue
+                      when {
+                          ANSWER_MARK.containsMatchIn(line) && hasQuestion -> {
+                              inAnswer = true
+                              val after = line.replace(ANSWER_MARK, "").trim()
+                              if (after.isNotEmpty()) a.append(after).append('\n')
+                          }
+                          QUESTION_MARK.containsMatchIn(line) -> {
+                              flush()
+                              q.append(line).append('\n')
+                              hasQuestion = true
+                              inAnswer = false
+                          }
+                          else -> {
+                              if (!hasQuestion) continue  // 跳过文档头部（封面/说明）
+                              if (inAnswer) a.append(line).append('\n') else q.append(line).append('\n')
+                          }
+                      }
+                  }
+                  flush()
+                  // 过滤过短的误识别题目
+                  val filtered = pairs.filter { it.first.length >= 4 }
+                  return Result(filtered, 0)
               }
           
               // ---------------- zip/XML 系（docx / pptx / xlsx） ----------------
@@ -569,11 +656,15 @@ jobs:
                   PDFBoxResourceLoader.init(context.applicationContext)
                   val doc = PDDocument.load(bytes)
                   return try {
-                      PDFTextStripper().getText(doc).lines()
+                      // 限制页数防 OOM：题库 PDF 页数通常不大，超过 300 页的部分不解析
+                      val stripper = PDFTextStripper().apply { endPage = 300 }
+                      stripper.getText(doc).lines()
                   } finally {
                       doc.close()
                   }
               }
+          
+              private const val MAX_FILE_BYTES = 30 * 1024 * 1024  // 30MB
           }
           SQEOF_6
           cat > app/src/main/java/com/example/screenqa/FloatService.kt <<'SQEOF_7'
@@ -587,8 +678,11 @@ jobs:
           import android.content.Context
           import android.content.Intent
           import android.content.pm.ServiceInfo
+          import android.content.res.Configuration
           import android.graphics.Bitmap
           import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
           import android.hardware.display.DisplayManager
           import android.hardware.display.VirtualDisplay
           import android.media.Image
@@ -600,28 +694,39 @@ jobs:
           import android.os.HandlerThread
           import android.os.IBinder
           import android.os.Looper
+          import android.text.SpannableStringBuilder
+          import android.text.Spanned
+          import android.text.style.ForegroundColorSpan
+          import android.text.style.StyleSpan
           import android.view.Gravity
           import android.view.MotionEvent
           import android.view.View
+          import android.view.ViewGroup
           import android.view.WindowManager
           import android.widget.Button
           import android.widget.LinearLayout
+          import android.widget.ScrollView
           import android.widget.TextView
           import com.google.mlkit.vision.common.InputImage
           import com.google.mlkit.vision.text.TextRecognition
           import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
           import java.util.concurrent.atomic.AtomicBoolean
+          import java.util.concurrent.atomic.AtomicInteger
           
           /**
-           * 悬浮窗 + 截屏 + OCR + 查库 / AI。
-           * Android 14 起：必须先以 mediaProjection 类型进入前台，再 getMediaProjection()，
-           * 且 createVirtualDisplay() 之前必须注册 MediaProjection.Callback，否则抛异常。
+           * 悬浮窗 + 截屏 + OCR + 查库 / AI（作业帮式卡片界面）。
+           * 稳定性要点：
+           *  - 识别按钮点击后立即禁用，流程结束才恢复（防连点导致资源叠加崩溃）。
+           *  - 每次截屏前释放旧的 VirtualDisplay / ImageReader / Bitmap。
+           *  - destroyed 标志：服务销毁后所有 OCR/AI 回调直接丢弃，避免访问已关闭资源。
+           *  - onConfigurationChanged：旋转等配置变化时保持悬浮窗。
            */
           class FloatService : Service() {
           
               private lateinit var windowManager: WindowManager
               private lateinit var floatView: View
               private lateinit var resultText: TextView
+              private lateinit var captureButton: Button
               private lateinit var overlayParams: WindowManager.LayoutParams
               private lateinit var db: QaDb
               private lateinit var mainHandler: Handler
@@ -634,8 +739,16 @@ jobs:
               private var viewAdded = false
               private var pendingResult: String? = null
           
+              // 缩小状态的小球
+              private var miniView: View? = null
+              private var miniParams: WindowManager.LayoutParams? = null
+              private var miniMode = false
+          
               @Volatile
               private var capturing = false
+          
+              @Volatile
+              private var destroyed = false
           
               private val recognizer by lazy {
                   TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
@@ -643,6 +756,7 @@ jobs:
           
               override fun onCreate() {
                   super.onCreate()
+                  destroyed = false
                   windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
                   db = QaDb(this)
                   mainHandler = Handler(Looper.getMainLooper())
@@ -697,59 +811,52 @@ jobs:
                   return START_NOT_STICKY
               }
           
+              // ---------------- 界面（作业帮式卡片） ----------------
+          
               private fun addFloatView() {
-                  val header = TextView(this).apply {
-                      text = "≡ 屏幕答题助手（按住拖动）"
+                  // 顶部标题栏：左侧拖动区，右侧关闭按钮（与底部识别按钮一上一下，远离防误触）
+                  val dragTitle = TextView(this).apply {
+                      text = "≡  答题助手"
                       setTextColor(0xFFFFFFFF.toInt())
-                      textSize = 13f
-                      setBackgroundColor(0xFF2B2B2B.toInt())
-                      setPadding(16, 10, 16, 10)
+                      textSize = 15f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setPadding(dp(14), dp(12), dp(8), dp(12))
                   }
-                  val captureButton = Button(this).apply {
-                      text = "识别当前屏幕"
-                      setOnClickListener { captureScreen() }
-                  }
-                  val closeButton = Button(this).apply {
-                      text = "关闭"
+                  val closeButton = TextView(this).apply {
+                      text = "×"
+                      setTextColor(0xFFFFFFFF.toInt())
+                      textSize = 24f
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                      setPadding(dp(16), dp(6), dp(16), dp(6))
                       setOnClickListener { stopSelf() }
                   }
-                  resultText = TextView(this).apply {
+                  // 缩小按钮：折叠成小球，避免遮挡屏幕
+                  val minimizeButton = TextView(this).apply {
+                      text = "—"
                       setTextColor(0xFFFFFFFF.toInt())
-                      textSize = 14f
-                      setPadding(16, 12, 16, 16)
-                      maxWidth = (resources.displayMetrics.widthPixels * 0.85f).toInt()
-                      text = "等待识别…"
+                      textSize = 20f
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                      setPadding(dp(14), dp(6), dp(14), dp(6))
+                      setOnClickListener { minimize() }
                   }
-                  val buttonRow = LinearLayout(this).apply {
+                  val header = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
+                      setBackgroundColor(COLOR_PRIMARY)
                       addView(
-                          captureButton,
+                          dragTitle,
                           LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                      )
+                      addView(
+                          minimizeButton,
+                          LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.WRAP_CONTENT,
+                              LinearLayout.LayoutParams.WRAP_CONTENT
+                          )
                       )
                       addView(
                           closeButton,
-                          LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                      )
-                  }
-                  floatView = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      setBackgroundColor(0xDD111111.toInt())
-                      addView(
-                          header,
-                          LinearLayout.LayoutParams(
-                              LinearLayout.LayoutParams.MATCH_PARENT,
-                              LinearLayout.LayoutParams.WRAP_CONTENT
-                          )
-                      )
-                      addView(
-                          buttonRow,
-                          LinearLayout.LayoutParams(
-                              LinearLayout.LayoutParams.MATCH_PARENT,
-                              LinearLayout.LayoutParams.WRAP_CONTENT
-                          )
-                      )
-                      addView(
-                          resultText,
                           LinearLayout.LayoutParams(
                               LinearLayout.LayoutParams.WRAP_CONTENT,
                               LinearLayout.LayoutParams.WRAP_CONTENT
@@ -757,8 +864,61 @@ jobs:
                       )
                   }
           
+                  resultText = TextView(this).apply {
+                      setTextColor(COLOR_TEXT)
+                      textSize = 14f
+                      setPadding(dp(14), dp(12), dp(14), dp(12))
+                      text = "点下方按钮识别当前屏幕题目"
+                  }
+                  // 答案区可滚动：内容少自适应，超过 45% 屏高时内部滚动，长解析不截断
+                  val resultScroll = object : ScrollView(this) {
+                      override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                          val maxH = (resources.displayMetrics.heightPixels * 0.45f).toInt()
+                          super.onMeasure(
+                              widthMeasureSpec,
+                              MeasureSpec.makeMeasureSpec(maxH, MeasureSpec.AT_MOST)
+                          )
+                      }
+                  }.apply {
+                      addView(
+                          resultText,
+                          ScrollView.LayoutParams(
+                              ScrollView.LayoutParams.MATCH_PARENT,
+                              ScrollView.LayoutParams.WRAP_CONTENT
+                          )
+                      )
+                  }
+          
+                  // 底部识别按钮：独立大行，上下留白，与关闭按钮分离
+                  captureButton = Button(this).apply {
+                      text = "识别当前屏幕"
+                      setTextColor(0xFFFFFFFF.toInt())
+                      textSize = 16f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setBackgroundColor(COLOR_PRIMARY)
+                      setOnClickListener { captureScreen() }
+                  }
+                  val captureWrap = LinearLayout(this).apply {
+                      setPadding(dp(12), dp(10), dp(12), dp(14))
+                      addView(
+                          captureButton,
+                          LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.MATCH_PARENT,
+                              LinearLayout.LayoutParams.WRAP_CONTENT
+                          )
+                      )
+                  }
+          
+                  floatView = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(COLOR_CARD)
+                      addView(header)
+                      addView(resultScroll)
+                      addView(captureWrap)
+                  }
+          
                   overlayParams = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      (resources.displayMetrics.widthPixels * 0.86f).toInt(),
                       WindowManager.LayoutParams.WRAP_CONTENT,
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                           WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -769,7 +929,7 @@ jobs:
                       PixelFormat.TRANSLUCENT
                   ).apply {
                       gravity = Gravity.TOP or Gravity.START
-                      x = 40
+                      x = (resources.displayMetrics.widthPixels * 0.07f).toInt()
                       y = 200
                   }
           
@@ -777,7 +937,7 @@ jobs:
                   var initialY = 0
                   var downX = 0f
                   var downY = 0f
-                  header.setOnTouchListener { _, event ->
+                  dragTitle.setOnTouchListener { _, event ->
                       when (event.action) {
                           MotionEvent.ACTION_DOWN -> {
                               initialX = overlayParams.x
@@ -810,12 +970,34 @@ jobs:
                   }
               }
           
+              // ---------------- 截屏 ----------------
+          
               private fun captureScreen() {
-                  if (capturing) return
+                  if (capturing || destroyed) return
                   val p = projection ?: run {
                       setResult("没有屏幕捕获权限，请打开 App 重新授权一次。")
                       return
                   }
+                  // 点击后立即禁用按钮，物理防连点；流程结束才恢复
+                  capturing = true
+                  runCatching {
+                      captureButton.isEnabled = false
+                      captureButton.text = "识别中…"
+                  }
+                  // 关键：截屏前隐藏悬浮窗，避免遮挡题目、避免自身文字被 OCR 识别进去
+                  runCatching { floatView.visibility = View.INVISIBLE }
+                  // 延迟约一帧让隐藏真正生效后再截屏
+                  mainHandler.postDelayed({ doCapture(p) }, 160)
+              }
+          
+              private fun doCapture(p: MediaProjection) {
+                  if (destroyed) return
+                  // 释放上一次截屏的残留资源，避免叠加崩溃
+                  runCatching { virtualDisplay?.release() }
+                  virtualDisplay = null
+                  runCatching { imageReader?.close() }
+                  imageReader = null
+          
                   val metrics = resources.displayMetrics
                   val width = metrics.widthPixels
                   val height = metrics.heightPixels
@@ -833,10 +1015,12 @@ jobs:
                       setResult("创建截屏失败：${e.message}")
                       runCatching { reader.close() }
                       imageReader = null
+                      capturing = false
+                      showFloatView()
+                      resetCaptureButton()
                       return
                   }
           
-                  capturing = true
                   setResult("正在截屏并识别…")
                   reader.setOnImageAvailableListener({ r ->
                       if (!consumed.compareAndSet(false, true)) return@setOnImageAvailableListener
@@ -848,14 +1032,39 @@ jobs:
                       val bitmap = runCatching { imageToBitmap(image) }.getOrNull()
                       image.close()
                       mainHandler.post {
+                          showFloatView()  // 拿到截图后立即恢复悬浮窗显示
                           runCatching { virtualDisplay?.release() }
                           virtualDisplay = null
                           runCatching { r.close() }
                           if (imageReader === r) imageReader = null
-                          capturing = false
-                          if (bitmap == null) setResult("截屏数据为空，请重试。") else runOcr(bitmap)
+                          if (bitmap == null) {
+                              capturing = false
+                              setResult("截屏数据为空，请重试。")
+                              resetCaptureButton()
+                          } else {
+                              runOcr(bitmap)
+                          }
                       }
                   }, captureHandler)
+              }
+          
+              private fun showFloatView() {
+                  if (::floatView.isInitialized && !destroyed) {
+                      runCatching { floatView.visibility = View.VISIBLE }
+                  }
+              }
+          
+              private fun resetCaptureButton() {
+                  val task = {
+                      if (::captureButton.isInitialized && !destroyed) {
+                          runCatching {
+                              captureButton.isEnabled = true
+                              captureButton.text = "识别当前屏幕"
+                          }
+                      }
+                      capturing = false
+                  }
+                  if (Looper.myLooper() == Looper.getMainLooper()) task() else mainHandler.post(task)
               }
           
               /** 必须处理 rowStride / pixelStride，否则部分机型截出来的图是斜的 */
@@ -875,47 +1084,214 @@ jobs:
               }
           
               private fun runOcr(bitmap: Bitmap) {
-                  recognizer.process(InputImage.fromBitmap(bitmap, 0))
-                      .addOnSuccessListener { visionText ->
-                          bitmap.recycle()
-                          handleQuestion(visionText.text)
-                      }
-                      .addOnFailureListener { e ->
-                          bitmap.recycle()
-                          setResult("OCR 失败：${e.message}")
-                      }
+                  if (destroyed) {
+                      runCatching { bitmap.recycle() }
+                      return
+                  }
+                  try {
+                      recognizer.process(InputImage.fromBitmap(bitmap, 0))
+                          .addOnSuccessListener { visionText ->
+                              runCatching { bitmap.recycle() }
+                              if (!destroyed) handleQuestion(visionText.text)
+                          }
+                          .addOnFailureListener { e ->
+                              runCatching { bitmap.recycle() }
+                              setResult("OCR 失败：${e.message}")
+                              resetCaptureButton()
+                          }
+                  } catch (e: Exception) {
+                      runCatching { bitmap.recycle() }
+                      setResult("OCR 启动失败：${e.message}")
+                      resetCaptureButton()
+                  }
               }
           
+              // ---------------- 题目处理（单题 / 多题） ----------------
+          
               private fun handleQuestion(ocrText: String) {
+                  if (destroyed) return
                   val cleaned = ocrText.trim()
                   if (cleaned.isEmpty()) {
                       setResult("没有识别到文字，换个页面再试。")
+                      resetCaptureButton()
                       return
                   }
-                  val localAnswer = db.search(cleaned)
-                  if (localAnswer != null) {
-                      setResult("【题库命中】\n$localAnswer")
+                  val questions = QuestionSplitter.split(cleaned)
+                  if (questions.isEmpty()) {
+                      setResult("没有识别到题目，换个页面再试。")
+                      resetCaptureButton()
+                      return
+                  }
+          
+                  if (questions.size == 1) {
+                      answerOne(questions[0]) { ans ->
+                          setResult(ans)
+                          resetCaptureButton()
+                      }
+                      return
+                  }
+          
+                  // 多题：逐题作答，按题号顺序汇总，避免答案混在一起
+                  val results = arrayOfNulls<String>(questions.size)
+                  val remaining = AtomicInteger(questions.size)
+                  setResult("识别到 ${questions.size} 道题，逐题解答中…")
+                  questions.forEachIndexed { i, q ->
+                      answerOne(q) { ans ->
+                          results[i] = "【第${i + 1}题】\n$ans"
+                          val left = remaining.decrementAndGet()
+                          if (left == 0) {
+                              setResult(results.joinToString("\n\n────────────────\n\n"))
+                              resetCaptureButton()
+                          } else {
+                              setResult("已解答 ${questions.size - left}/${questions.size} 题…")
+                          }
+                      }
+                  }
+              }
+          
+              /** 单题作答：先查本地题库，未命中再问 AI。callback 保证只被调用一次。 */
+              private fun answerOne(question: String, callback: (String) -> Unit) {
+                  if (destroyed) {
+                      callback("")
+                      return
+                  }
+                  val local = runCatching { db.search(question) }.getOrNull()
+                  if (local != null) {
+                      callback("【答案】\n${TextCleaner.clean(local).trim()}")
                       return
                   }
                   if (!AiClient.isConfigured(this)) {
-                      setResult("题库未命中，且未配置 API Key。\n请打开 App 填写 DeepSeek Key。\n\n识别到的文字：${cleaned.take(120)}")
+                      callback("【答案】\n题库未命中，且未配置 API Key（打开 App 填写 DeepSeek Key 后可 AI 解答）")
                       return
                   }
-                  setResult("题库未命中，AI 解答中…")
-                  AiClient.ask(this, cleaned) { answer ->
-                      mainHandler.post { setResult("【AI】\n$answer") }
+                  AiClient.ask(this, question) { ans ->
+                      mainHandler.post {
+                          if (!destroyed) callback(ans)
+                      }
                   }
               }
+          
+              // ---------------- 结果展示（答案蓝色加粗、解析灰色） ----------------
           
               private fun setResult(text: String) {
                   val task = {
                       if (::resultText.isInitialized) {
-                          resultText.text = text
+                          resultText.text = styleText(TextCleaner.clean(text))
                       } else {
                           pendingResult = text
                       }
                   }
                   if (Looper.myLooper() == Looper.getMainLooper()) task() else mainHandler.post(task)
+              }
+          
+              private fun styleText(text: String): CharSequence {
+                  val ssb = SpannableStringBuilder(text)
+                  fun color(regex: Regex, colorInt: Int, bold: Boolean) {
+                      regex.findAll(text).forEach { m ->
+                          ssb.setSpan(
+                              ForegroundColorSpan(colorInt),
+                              m.range.first, m.range.last + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                          )
+                          if (bold) ssb.setSpan(
+                              StyleSpan(Typeface.BOLD),
+                              m.range.first, m.range.last + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                          )
+                      }
+                  }
+                  color(Regex("【第\\d+题】"), COLOR_PRIMARY, true)
+                  color(Regex("【答案】"), COLOR_PRIMARY, true)
+                  color(Regex("【题库】"), COLOR_PRIMARY, true)
+                  color(Regex("【解析】"), COLOR_GRAY, false)
+                  return ssb
+              }
+          
+              // ---------------- 配置变化 / 生命周期 ----------------
+          
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  // 旋转等配置变化时保持悬浮窗，不销毁；必要时刷新布局
+                  if (viewAdded && ::floatView.isInitialized) {
+                      runCatching { windowManager.updateViewLayout(floatView, overlayParams) }
+                  }
+              }
+          
+              // ---------------- 缩小 / 展开（防遮挡屏幕） ----------------
+          
+              private fun minimize() {
+                  if (!viewAdded || miniMode) return
+                  runCatching { windowManager.removeView(floatView) }
+                  viewAdded = false
+                  if (miniView == null) createMiniView()
+                  val mv = miniView
+                  val mp = miniParams
+                  if (mv != null && mp != null) {
+                      runCatching { windowManager.addView(mv, mp) }
+                      miniMode = true
+                  }
+              }
+          
+              private fun expand() {
+                  if (!miniMode) return
+                  runCatching { miniView?.let { windowManager.removeView(it) } }
+                  runCatching { windowManager.addView(floatView, overlayParams) }
+                  viewAdded = true
+                  miniMode = false
+              }
+          
+              private fun createMiniView() {
+                  val ball = TextView(this).apply {
+                      text = "答"
+                      setTextColor(0xFFFFFFFF.toInt())
+                      textSize = 20f
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(COLOR_PRIMARY)
+                      }
+                  }
+                  val params = WindowManager.LayoutParams(
+                      dp(56), dp(56),
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                      else WindowManager.LayoutParams.TYPE_PHONE,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = resources.displayMetrics.widthPixels - dp(70)
+                      y = 400
+                  }
+                  var downX = 0f
+                  var downY = 0f
+                  var initX = 0
+                  var initY = 0
+                  var moved = false
+                  ball.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = event.rawX; downY = event.rawY
+                              initX = params.x; initY = params.y; moved = false
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (event.rawX - downX).toInt()
+                              val dy = (event.rawY - downY).toInt()
+                              if (kotlin.math.abs(dx) > 8 || kotlin.math.abs(dy) > 8) moved = true
+                              params.x = initX + dx
+                              params.y = initY + dy
+                              runCatching { windowManager.updateViewLayout(ball, params) }
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (!moved) expand()  // 几乎没移动 = 点击 → 展开
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+                  miniView = ball
+                  miniParams = params
               }
           
               private fun createNotificationChannel() {
@@ -954,10 +1330,15 @@ jobs:
               }
           
               override fun onDestroy() {
+                  destroyed = true
                   releaseProjection()
                   if (viewAdded) {
                       runCatching { windowManager.removeView(floatView) }
                       viewAdded = false
+                  }
+                  if (miniMode) {
+                      runCatching { miniView?.let { windowManager.removeView(it) } }
+                      miniMode = false
                   }
                   runCatching { db.close() }
                   captureThread.quitSafely()
@@ -966,11 +1347,19 @@ jobs:
           
               override fun onBind(intent: Intent?): IBinder? = null
           
+              private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+          
               companion object {
                   const val EXTRA_RESULT_CODE = "resultCode"
                   const val EXTRA_DATA = "data"
                   private const val CHANNEL_ID = "screenqa"
                   private const val NOTIFICATION_ID = 1
+          
+                  // 作业帮式配色：主色蓝、卡片白、正文深灰、解析灰
+                  private val COLOR_PRIMARY = 0xFF4A90D9.toInt()
+                  private val COLOR_CARD = 0xF5FFFFFF.toInt()
+                  private val COLOR_TEXT = 0xFF222222.toInt()
+                  private val COLOR_GRAY = 0xFF666666.toInt()
               }
           }
           SQEOF_7
@@ -996,6 +1385,7 @@ jobs:
           import android.widget.TextView
           import android.widget.Toast
           import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AlertDialog
           import androidx.appcompat.app.AppCompatActivity
           import androidx.core.content.ContextCompat
           import kotlin.concurrent.thread
@@ -1148,7 +1538,7 @@ jobs:
                           2. 导入题库的文件内容规则：
                              · txt / csv：每行一题，题目和答案用英文逗号、制表符或中文逗号分隔，例如「中国的首都,北京」；含逗号的字段用英文双引号包裹。
                              · xlsx：第一个工作表，A 列题目、B 列答案。
-                             · docx / pptx / pdf：每段（每行）一题，同样用逗号或制表符分隔题目和答案。
+                             · docx / pptx / pdf：支持两种写法，自动判断。① 每段一题，用逗号或制表符分隔「题目,答案」；② 结构化题库（如实训报告），用【编程题】【单选题】等标记题目开始、用【答案】【解析】【程序运行示例】等标记答案开始，题目与答案都可以跨多段，会自动逐题配对。
                              · 第一行是「question,answer」或「题目,答案」表头时会自动跳过；同一题目重复导入会覆盖旧答案。
                           3. 题库命中不消耗任何费用；未命中才会调用 AI（需 Key 且按量计费）。
                           4. 手机重启或 App 被杀后屏幕捕获授权会失效，重开 App 再点一次 ② 即可。
@@ -1172,8 +1562,26 @@ jobs:
                   root.addView(helpTitle, lp())
                   root.addView(help, lp())
           
+                  val logButton = Button(this).apply {
+                      text = "查看崩溃日志（排查用）"
+                      setOnClickListener { showCrashLog() }
+                  }
+                  root.addView(logButton, lp())
+          
                   val scroll = ScrollView(this).apply { addView(root) }
                   setContentView(scroll)
+              }
+          
+              private fun showCrashLog() {
+                  val content = runCatching {
+                      val f = QaApp.crashLogFile(this)
+                      if (f.exists()) f.readText().takeLast(4000) else ""
+                  }.getOrDefault("")
+                  AlertDialog.Builder(this)
+                      .setTitle("崩溃日志")
+                      .setMessage(if (content.isBlank()) "暂无崩溃记录" else content)
+                      .setPositiveButton("关闭", null)
+                      .show()
               }
           
               // ---------------- 导入 ----------------
@@ -1193,16 +1601,25 @@ jobs:
                   importing = true
                   importResultText.text = "正在导入 $name ..."
                   thread {
-                      val result = BankImporter.import(this, uri, ext)
-                      val added = if (result.error == null) db.insertBatch(result.pairs) else 0
-                      runOnUiThread {
-                          importing = false
-                          importResultText.text = if (result.error != null) {
-                              "导入失败：${result.error}"
-                          } else {
-                              "导入完成：成功 $added 条，跳过 ${result.skipped} 条（空行/格式不符/表头）"
+                      try {
+                          val result = BankImporter.import(this, uri, ext)
+                          val added = if (result.error == null) db.insertBatch(result.pairs) else 0
+                          runOnUiThread {
+                              importing = false
+                              importResultText.text = if (result.error != null) {
+                                  "导入失败：${result.error}"
+                              } else {
+                                  "导入完成：成功 $added 条，跳过 ${result.skipped} 条（空行/格式不符/表头）"
+                              }
+                              refreshStatus()
                           }
-                          refreshStatus()
+                      } catch (t: Throwable) {
+                          // 兜住 OOM 等 Error，导入异常不闪退
+                          runOnUiThread {
+                              importing = false
+                              importResultText.text = "导入异常：${t.javaClass.simpleName}：${t.message ?: "未知原因"}"
+                              refreshStatus()
+                          }
                       }
                   }
               }
@@ -1271,7 +1688,67 @@ jobs:
               }
           }
           SQEOF_8
-          cat > app/src/main/java/com/example/screenqa/QaDb.kt <<'SQEOF_9'
+          cat > app/src/main/java/com/example/screenqa/QaApp.kt <<'SQEOF_9'
+          package com.example.screenqa
+          
+          import android.app.Application
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Process
+          import java.io.File
+          import java.io.PrintWriter
+          import java.io.StringWriter
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.system.exitProcess
+          
+          /**
+           * 全局崩溃防护：任何未捕获异常（含子线程的 OutOfMemoryError 等）先写日志，
+           * 再自动重启主界面 —— 把"莫名闪退"变成"自动回到 App"，避免考试中途退出。
+           * 10 秒内重复崩溃则不重启，防止崩溃死循环。
+           */
+          class QaApp : Application() {
+          
+              override fun onCreate() {
+                  super.onCreate()
+                  Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+                      runCatching { writeCrashLog(thread, throwable) }
+                      if (markCrashAndShouldRestart()) {
+                          runCatching {
+                              startActivity(Intent(this, MainActivity::class.java).apply {
+                                  addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                              })
+                          }
+                      }
+                      Process.killProcess(Process.myPid())
+                      exitProcess(10)
+                  }
+              }
+          
+              private fun writeCrashLog(thread: Thread, throwable: Throwable) {
+                  val sw = StringWriter()
+                  throwable.printStackTrace(PrintWriter(sw))
+                  val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+                  val log = "==== $time  线程:${thread.name}  ${throwable.javaClass.name} ====\n$sw\n\n"
+                  crashLogFile(this).appendText(log)
+              }
+          
+              /** 记录崩溃时间；距上次崩溃不足 10 秒则返回 false（不重启，避免循环） */
+              private fun markCrashAndShouldRestart(): Boolean {
+                  val sp = getSharedPreferences("crash_guard", MODE_PRIVATE)
+                  val now = System.currentTimeMillis()
+                  val last = sp.getLong("last_crash", 0L)
+                  sp.edit().putLong("last_crash", now).apply()
+                  return now - last > 10_000
+              }
+          
+              companion object {
+                  fun crashLogFile(context: Context): File = File(context.filesDir, "crash.log")
+              }
+          }
+          SQEOF_9
+          cat > app/src/main/java/com/example/screenqa/QaDb.kt <<'SQEOF_10'
           package com.example.screenqa
           
           import android.content.Context
@@ -1306,7 +1783,7 @@ jobs:
                                   if (row.size >= 2 && row[0].isNotBlank()) {
                                       db.execSQL(
                                           "INSERT INTO qa(question, answer) VALUES(?,?)",
-                                          arrayOf(normalize(row[0]), row[1].trim())
+                                          arrayOf(normalize(row[0]), TextCleaner.clean(row[1]).trim())
                                       )
                                   }
                               }
@@ -1392,7 +1869,7 @@ jobs:
                               db.execSQL("DELETE FROM qa WHERE question = ?", arrayOf(nq))
                               db.execSQL(
                                   "INSERT INTO qa(question, answer) VALUES(?,?)",
-                                  arrayOf(nq, a.trim())
+                                  arrayOf(nq, TextCleaner.clean(a).trim())
                               )
                               count++
                           }
@@ -1424,30 +1901,106 @@ jobs:
                   private const val CSV_FILE = "qa.csv"
               }
           }
-          SQEOF_9
-          cat > app/src/main/res/values/themes.xml <<'SQEOF_10'
+          SQEOF_10
+          cat > app/src/main/java/com/example/screenqa/QuestionSplitter.kt <<'SQEOF_11'
+          package com.example.screenqa
+          
+          /**
+           * 把一屏 OCR 文本拆成多道题。
+           * 题目起始行特征：行首题号（1. / 2、 / （1）/ 第3题）或【单选题】等题型标记。
+           * 选项 A. B. C. 是字母开头，不会被误当题号。
+           * 没有明显题号时整屏按一道题处理。
+           */
+          object QuestionSplitter {
+          
+              private val QUESTION_START = Regex(
+                  "^(\\d{1,4}[.、．]\\s*\\S|[（(]\\d{1,4}[)）]|第\\d+题|【[^】]*题[^】]*】)"
+              )
+          
+              fun split(ocrText: String): List<String> {
+                  val lines = ocrText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                  if (lines.isEmpty()) return emptyList()
+          
+                  val starts = lines.indices.filter { QUESTION_START.containsMatchIn(lines[it]) }
+                  if (starts.size <= 1) return listOf(ocrText.trim())
+          
+                  val out = mutableListOf<String>()
+                  for (k in starts.indices) {
+                      val from = starts[k]
+                      val to = if (k + 1 < starts.size) starts[k + 1] else lines.size
+                      val q = lines.subList(from, to).joinToString("\n").trim()
+                      if (q.isNotEmpty()) out += q
+                  }
+                  return if (out.isEmpty()) listOf(ocrText.trim()) else out
+              }
+          }
+          SQEOF_11
+          cat > app/src/main/java/com/example/screenqa/TextCleaner.kt <<'SQEOF_12'
+          package com.example.screenqa
+          
+          /**
+           * 文本清洗：去掉导致显示乱码的不可见字符，并清理 AI 答案里的 Markdown 符号。
+           * 题库答案、AI 答案在显示前统一过一遍，避免"答案乱码"。
+           */
+          object TextCleaner {
+          
+              /** 去除 BOM、零宽字符、控制字符、\r；不换行空格转普通空格；保留 \n 和 \t */
+              fun clean(s: String): String {
+                  if (s.isEmpty()) return s
+                  val sb = StringBuilder(s.length)
+                  for (ch in s) {
+                      when {
+                          // 零宽字符 / BOM —— 直接删除
+                          ch == '\uFEFF' || ch == '\u200B' || ch == '\u200C' ||
+                              ch == '\u200D' || ch == '\u2060' -> {
+                          }
+                          // 不换行空格（常见于 PDF/网页复制）转普通空格，避免显示成方框
+                          ch == '\u00A0' -> sb.append(' ')
+                          ch == '\r' -> {
+                          }
+                          // 其他控制字符删除，但保留换行和制表符
+                          ch.isISOControl() && ch != '\n' && ch != '\t' -> {
+                          }
+                          else -> sb.append(ch)
+                      }
+                  }
+                  return sb.toString()
+              }
+          
+              /** AI 答案专用：额外去掉 Markdown 标记（** 粗体、## 标题、``` 代码块、列表符号） */
+              fun cleanAnswer(s: String): String {
+                  var t = clean(s)
+                  t = t.replace("```", "")
+                  t = t.replace(Regex("\\*\\*(.+?)\\*\\*", RegexOption.DOT_MATCHES_ALL), "$1")
+                  t = t.replace(Regex("(?m)^\\s*#{1,6}\\s*"), "")
+                  t = t.replace(Regex("(?m)^\\s*[-*+]\\s+"), "")
+                  return t.trim()
+              }
+          }
+          SQEOF_12
+          cat > app/src/main/res/values/themes.xml <<'SQEOF_13'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <style name="Theme.ScreenQA" parent="Theme.AppCompat.Light.NoActionBar">
                   <item name="android:windowNoTitle">true</item>
               </style>
           </resources>
-          SQEOF_10
-          cat > build.gradle.kts <<'SQEOF_11'
+          SQEOF_13
+          cat > build.gradle.kts <<'SQEOF_14'
           // 根工程：只声明插件版本，不写仓库地址（统一由 settings.gradle.kts 管理）
           plugins {
               id("com.android.application") version "8.7.3" apply false
               id("org.jetbrains.kotlin.android") version "2.2.21" apply false
           }
-          SQEOF_11
-          cat > gradle.properties <<'SQEOF_12'
+          SQEOF_14
+          cat > gradle.properties <<'SQEOF_15'
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           org.gradle.parallel=true
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           kotlin.code.style=official
-          SQEOF_12
-          cat > settings.gradle.kts <<'SQEOF_13'
+          SQEOF_15
+          cat > settings.gradle.kts <<'SQEOF_16'
           pluginManagement {
               repositories {
                   google()
@@ -1466,7 +2019,7 @@ jobs:
           
           rootProject.name = "ScreenQA"
           include(":app")
-          SQEOF_13
+          SQEOF_16
           echo "源码展开完成，共 $(find . -type f -not -path "./.git/*" | wc -l) 个文件"
 
       - name: 安装 JDK 17
@@ -1588,4 +2141,7 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: ScreenQA 构建 #${{ github.run_number }}
           files: ScreenQA.apk
-          body: 云端自动编译的 debug 签名 APK，Android 10+ 手机可直接下载安装。
+          body: |
+            云端自动编译的 debug 签名 APK，Android 10+ 手机可直接下载安装。
+            若手机已安装旧版本，请先卸载再安装（云端每次构建的 debug 签名不同，无法直接覆盖）。
+            安装后：打开 App → ①开启悬浮窗权限 → ②授权屏幕捕获并启动 → 切到题目页面点「识别当前屏幕」。
