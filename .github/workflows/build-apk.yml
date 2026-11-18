@@ -976,7 +976,7 @@ jobs:
           // 根工程：只声明插件版本，不写仓库地址（统一由 settings.gradle.kts 管理）
           plugins {
               id("com.android.application") version "8.7.3" apply false
-              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.android") version "2.2.21" apply false
           }
           SQEOF_10
           cat > gradle.properties <<'SQEOF_11'
