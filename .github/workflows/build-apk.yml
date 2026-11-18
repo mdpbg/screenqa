@@ -87,7 +87,10 @@ jobs:
               implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
               implementation("com.google.mlkit:text-recognition:16.0.1")
           
-              implementation("com.squareup.okhttp3:okhttp:5.5.0")
+              // 不能用 5.4.0+：其 Android 变体 okhttp-android 的 minCompileSdk=36/37，超出本工程的
+              // compileSdk=35，会在 :app:checkDebugAarMetadata 直接失败（实测 5.5.0 报 "requires ... version 37"）。
+              // 5.3.2 的 minCompileSdk=1，兼容，且 API 与 5.5 一致（toMediaType/toRequestBody 均可用）。
+              implementation("com.squareup.okhttp3:okhttp:5.3.2")
           
               // 注意：org.json 由 Android 平台自带，不需要额外依赖，加了反而容易 duplicate class
           }
