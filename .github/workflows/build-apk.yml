@@ -985,11 +985,8 @@ jobs:
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.Service
-          import android.content.ClipData
-          import android.content.ClipboardManager
           import android.content.Context
           import android.content.Intent
-          import android.widget.Toast
           import android.content.pm.ServiceInfo
           import android.content.res.Configuration
           import android.graphics.Bitmap
@@ -1007,6 +1004,7 @@ jobs:
           import android.os.HandlerThread
           import android.os.IBinder
           import android.os.Looper
+          import android.text.Selection
           import android.text.SpannableStringBuilder
           import android.text.Spanned
           import android.text.style.ForegroundColorSpan
@@ -1046,9 +1044,6 @@ jobs:
               private lateinit var floatView: View
               private lateinit var resultText: TextView
               private lateinit var captureButton: Button
-              private lateinit var copyButton: Button
-              // 最近一次展示的答案纯文本（不含颜色 span），供"复制答案"使用
-              @Volatile private var lastAnswerText: String = ""
               private lateinit var overlayParams: WindowManager.LayoutParams
               private lateinit var db: QaDb
               private lateinit var mainHandler: Handler
@@ -1062,6 +1057,8 @@ jobs:
               private var captureHeight = 0
               private var viewAdded = false
               private var pendingResult: String? = null
+              // 期望的"文本可选中"状态：缩小/展开悬浮窗时据此恢复焦点 flag（单次检查点，避免状态漂移）
+              @Volatile private var selectionAllowed = false
           
               // 缩小状态的小球
               private var miniView: View? = null
@@ -1219,6 +1216,8 @@ jobs:
                       setTextColor(COLOR_TEXT)
                       textSize = 14f
                       setPadding(dp(14), dp(12), dp(14), dp(12))
+                      setTextIsSelectable(true) // 答案可像文档一样用光标自由选中、长按复制
+                      setHighlightColor(0x663B6EF5.toInt()) // 选中高亮色（与主题蓝一致）
                       text = "点下方按钮识别当前屏幕题目"
                   }
                   // 答案区可滚动：内容少自适应，超过 45% 屏高时内部滚动，长解析不截断
@@ -1252,30 +1251,14 @@ jobs:
                       setBackgroundColor(COLOR_PRIMARY)
                       setOnClickListener { captureScreen() }
                   }
-                  // "复制答案"按钮：悬浮窗为 FLAG_NOT_FOCUSABLE，TextView 直接开启可选中会与拖动/触摸
-                  // 冲突，因此用独立的复制按钮把最近一次答案写入系统剪贴板，稳定且零焦点副作用。
-                  copyButton = Button(this).apply {
-                      text = "复制答案"
-                      setTextColor(COLOR_PRIMARY)
-                      textSize = 14f
-                      setBackgroundColor(0xFFE8F0FE.toInt())
-                      setOnClickListener { copyAnswerToClipboard() }
-                  }
                   val captureWrap = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
                       setPadding(dp(12), dp(10), dp(12), dp(14))
                       addView(
                           captureButton,
                           LinearLayout.LayoutParams(
-                              0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
-                          )
-                      )
-                      addView(
-                          copyButton,
-                          LinearLayout.LayoutParams(
-                              LinearLayout.LayoutParams.WRAP_CONTENT,
+                              LinearLayout.LayoutParams.MATCH_PARENT,
                               LinearLayout.LayoutParams.WRAP_CONTENT
-                          ).apply { leftMargin = dp(8) }
+                          )
                       )
                   }
           
@@ -1375,6 +1358,10 @@ jobs:
                   // CAS 硬锁：连点、误触、回调重入全部被丢弃，不会叠加资源或重复请求
                   if (!capturing.compareAndSet(false, true)) return
                   val seq = flowSeq.incrementAndGet()
+          
+                  // 新一轮识别：无论上一轮用户是否正在选中答案，都恢复"不抢焦点"，
+                  // 否则悬浮窗保持可聚焦会截走下层 App 的输入焦点并留下选区高亮。
+                  setSelectionEnabled(false) // 交还焦点并清选区高亮
           
                   if (projection == null || virtualDisplay == null || imageReader == null) {
                       setResult("屏幕捕获未就绪，请打开 App 点第 ② 步重新授权。")
@@ -1576,26 +1563,36 @@ jobs:
                   }
               }
           
-              /** 单题作答：先查本地题库，未命中再问 AI。callback 保证只被调用一次。 */
+              /**
+               * 单题作答，严格按「题库优先、AI 兜底」顺序：
+               *  1) 先查本地题库 —— 命中即返回，来源标【题库】，秒出、不消耗算力；
+               *  2) 题库未命中且配置了 API Key —— 才调用 AI（联网、较慢）；
+               *  3) 既未命中也没配 Key —— 给出明确提示，不静默失败。
+               * callback 保证只被调用一次。
+               */
               private fun answerOne(question: String, callback: (String) -> Unit) {
                   if (destroyed) {
                       runCatching { callback("") }
                       return
                   }
                   try {
-                      val local = runCatching { db.search(question) }.getOrNull()
-                      if (local != null) {
+                      val local = runCatching { db.search(question) }.getOrNull()?.trim()
+                      if (!local.isNullOrEmpty()) {
                           // 标明来源来自题库：配置了 AI Key 却本地命中时，用户能看清本次走的是题库而非 AI
                           callback("【题库】\n【答案】\n${TextCleaner.clean(local).trim()}")
                           return
                       }
+                      // 题库未命中（含查到空答案）→ 继续走 AI 兜底
                       if (!AiClient.isConfigured(this)) {
                           callback("【答案】\n题库未命中，且未配置 API Key（打开 App 选择 AI 服务商并填写对应 Key 后可 AI 解答）")
                           return
                       }
+                      // 捕获发起时的流程序号：AI 是异步的，若期间用户已发起新一轮识别，
+                      // 旧回调必须丢弃，否则会在新一轮中途重新聚焦、抢走下层 App 焦点。
+                      val mySeq = flowSeq.get()
                       AiClient.ask(this, question) { ans ->
                           mainHandler.post {
-                              if (destroyed) return@post
+                              if (destroyed || flowSeq.get() != mySeq) return@post
                               try {
                                   callback(ans)
                               } catch (t: Throwable) {
@@ -1620,8 +1617,8 @@ jobs:
                   // 不显式声明会被 K2 推断成 () -> Any，导致 mainHandler.post 报类型不匹配。
                   val task: () -> Unit = {
                       val cleaned = runCatching { TextCleaner.clean(text) }.getOrDefault(text)
-                      // 只记录真正的答案，不记录"识别中…"等状态文本，避免复制到状态文字
-                      if (isAnswer) lastAnswerText = cleaned
+                      // 真正的答案就绪后，临时允许窗口聚焦，用户即可用光标选中、长按复制答案
+                      if (isAnswer) setSelectionEnabled(true)
                       if (::resultText.isInitialized) {
                           runCatching { resultText.text = styleText(cleaned) }
                               .onFailure { runCatching { resultText.text = cleaned } }
@@ -1637,24 +1634,45 @@ jobs:
                   }
               }
           
-              /** 把最近一次答案写入系统剪贴板，并给出可见提示（悬浮窗无焦点，Toast 仍可正常显示）。 */
-              private fun copyAnswerToClipboard() {
-                  val text = lastAnswerText.trim()
-                  if (text.isEmpty()) {
-                      runCatching { Toast.makeText(applicationContext, "暂无可复制的答案", Toast.LENGTH_SHORT).show() }
-                      return
+              /**
+               * 焦点模式深模块：把"是否允许与悬浮窗文本交互"封装在单一接缝里。
+               *  - enabled=true（答案就绪）：清除 FLAG_NOT_FOCUSABLE，令 TextView 的
+               *    光标选中与系统「复制/全选」菜单可用；
+               *  - enabled=false（新一轮识别）：恢复 FLAG_NOT_FOCUSABLE，避免悬浮窗
+               *    抢走下层 App（如学习通）的焦点，保证截屏与输入不受影响。
+               * 调用方只需传布尔，不接触 WindowManager 位运算；重复调用幂等。
+               */
+              private fun setSelectionEnabled(enabled: Boolean) {
+                  // 无论窗口当前是否挂载，都先记录期望状态：缩小后答案就绪、再展开时能据此恢复
+                  selectionAllowed = enabled
+                  if (!::overlayParams.isInitialized || !::floatView.isInitialized || !viewAdded) return
+                  val base = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                  val wantFocusable = enabled
+                  val alreadyFocusable = (overlayParams.flags and base) == 0
+                  if (wantFocusable == alreadyFocusable) return // 幂等：状态已符合，避免多余 updateViewLayout
+                  if (!wantFocusable) {
+                      // 交还焦点：窗口正持有焦点时仅加回 flag 不足以让焦点可靠回到下层 App，
+                      // 会导致学习通输入框无法点击/键盘不弹。先主动释放 TextView 焦点再改 flag。
+                      runCatching {
+                          if (::resultText.isInitialized && resultText.hasFocus()) resultText.clearFocus()
+                          floatView.clearFocus()
+                      }
+                      clearTextSelection()
                   }
-                  val copied = runCatching {
-                      val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                      cm.setPrimaryClip(ClipData.newPlainText("ScreenQA 答案", text))
-                      true
-                  }.getOrDefault(false)
+                  overlayParams.flags = if (wantFocusable) {
+                      overlayParams.flags and base.inv()
+                  } else {
+                      overlayParams.flags or base
+                  }
+                  runCatching { windowManager.updateViewLayout(floatView, overlayParams) }
+              }
+          
+              /** 正确清除 TextView 的选区高亮：Selection 由 android.text.Selection 管理，clearFocus 清不掉。 */
+              private fun clearTextSelection() {
                   runCatching {
-                      Toast.makeText(
-                          applicationContext,
-                          if (copied) "答案已复制" else "复制失败，请重试",
-                          Toast.LENGTH_SHORT
-                      ).show()
+                      if (::resultText.isInitialized && resultText.text is SpannableStringBuilder) {
+                          Selection.removeSelection(resultText.text)
+                      }
                   }
               }
           
@@ -1734,6 +1752,8 @@ jobs:
                   runCatching { windowManager.addView(floatView, overlayParams) }
                   viewAdded = true
                   miniMode = false
+                  // 恢复缩小前期望的焦点状态：若当时答案是可选中的，展开后仍应可选中复制
+                  setSelectionEnabled(selectionAllowed)
               }
           
               private fun createMiniView() {
