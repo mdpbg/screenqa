@@ -61,8 +61,8 @@ jobs:
                   minSdk = 29              // Android 10+
                   targetSdk = 35
                   multiDexEnabled = true  // PDFBox 类较多；minSdk>=21 原生支持，无需 multidex 依赖库
-                  versionCode = 8
-                  versionName = "2.6"
+                  versionCode = 9
+                  versionName = "2.7"
                   buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekKey\"")
               }
           
@@ -633,13 +633,90 @@ jobs:
               // 题目之间的分隔线（如一串 ====）：遇到即结束当前答案区，避免吞入后续内容。
               private val SECTION_SEPARATOR = Regex("^=+\\s*$")
           
-              /** 统一入口：含结构化标记用段落状态机，否则用"题目,答案"简单格式 */
+              // ---------------- 编号选择题库解析（1、/ 1. / 1．题号 + A/B/C/D + 答案/解析） ----------------
+              // 真实题库（如军事理论/公考/教材题库）普遍采用这种格式，而非【编程题】方括号标记。
+              // 旧版只认【】标记，遇到编号题库会识别出 0 题——这是"导入后题目数量不对/无法导入"的根因。
+              private val NUMBERED_QUESTION_START = Regex("^\\d{1,4}\\s*[、.．]")   // 题号起点
+              // 答案标记：兼容"答案：""正确答案：""参考答案："，冒号后内容即答案首行
+              private val NUMBERED_ANSWER_MARK = Regex("^\\s*(正确答案|参考答案|答案)\\s*[:：]\\s*(.*)$")
+              // 解析标记：兼容"解析：""答案解析：""【解析】"
+              private val NUMBERED_EXP_MARK = Regex("^\\s*(解析|答案解析|【解析】)\\s*[:：]?\\s*(.*)$")
+          
+              /**
+               * 统一入口：按题库格式自动路由到对应解析器。
+               *  1) 编号选择题库（题号+选项+答案）→ parseNumbered
+               *  2) 【编程题】类结构化标记 → parseStructured
+               *  3) "题目,答案"简单格式 → parseLines
+               */
               fun parseParagraphs(lines: List<String>): Result {
                   val cleaned = lines.map { TextCleaner.clean(it).trim() }
+                  val numberedCount = countNumberedQuestions(cleaned)
+                  // 至少 2 道编号题才判定为编号题库：避免把正文里偶发的"1、"误判成题库。
+                  if (numberedCount >= 2) return parseNumbered(cleaned)
                   val structured = cleaned.any {
                       QUESTION_TYPE_MARK.containsMatchIn(it) || ANSWER_MARK.containsMatchIn(it)
                   }
                   return if (structured) parseStructured(cleaned) else parseLines(cleaned)
+              }
+          
+              private fun countNumberedQuestions(cleaned: List<String>): Int =
+                  flattenLogicalLines(cleaned).count { NUMBERED_QUESTION_START.containsMatchIn(it) }
+          
+              /** 段落按软换行(\n)展开成逻辑行并去空白——答案/解析常在同一段落内用换行分隔 */
+              private fun flattenLogicalLines(lines: List<String>): List<String> =
+                  lines.flatMap { it.split('\n') }.map { it.trim() }.filter { it.isNotEmpty() }
+          
+              /**
+               * 编号选择题库解析：题号行切题，题干内分出答案区与解析区。
+               * 答案统一加【答案】【解析】标记，供显示层着色分区（与 AI 答案格式一致）。
+               */
+              private fun parseNumbered(lines: List<String>): Result {
+                  val logical = flattenLogicalLines(lines)
+                  val starts = logical.indices.filter { NUMBERED_QUESTION_START.containsMatchIn(logical[it]) }
+                  if (starts.isEmpty()) return Result(emptyList(), 0)
+          
+                  val pairs = mutableListOf<Pair<String, String>>()
+                  for (k in starts.indices) {
+                      val from = starts[k]
+                      val to = if (k + 1 < starts.size) starts[k + 1] else logical.size
+                      val q = StringBuilder()
+                      val ans = StringBuilder()
+                      val exp = StringBuilder()
+                      var zone = 'q' // q=题干, a=答案, e=解析
+                      for (i in from until to) {
+                          val line = logical[i]
+                          val ma = NUMBERED_ANSWER_MARK.matchEntire(line)
+                          val me = NUMBERED_EXP_MARK.matchEntire(line)
+                          when {
+                              ma != null -> {
+                                  zone = 'a'
+                                  val tail = ma.groupValues[2].trim()
+                                  if (tail.isNotEmpty() && !NUMBERED_EXP_MARK.containsMatchIn(tail)) {
+                                      ans.append(tail).append('\n')
+                                  }
+                              }
+                              me != null -> {
+                                  zone = 'e'
+                                  val tail = me.groupValues[2].trim()
+                                  if (tail.isNotEmpty()) exp.append(tail).append('\n')
+                              }
+                              zone == 'q' -> q.append(line).append('\n')
+                              zone == 'a' -> ans.append(line).append('\n')
+                              else -> exp.append(line).append('\n')
+                          }
+                      }
+                      val question = q.toString().trim()
+                      if (question.length < 4) continue
+                      val answerText = ans.toString().trim()
+                      val expText = exp.toString().trim()
+                      val answer = buildString {
+                          append("【答案】\n")
+                          append(if (answerText.isNotEmpty()) answerText else "（本题无参考答案，可用 AI 解答）")
+                          if (expText.isNotEmpty()) append("\n【解析】\n").append(expText)
+                      }
+                      pairs += question to answer
+                  }
+                  return Result(pairs, 0)
               }
           
               /**
@@ -908,8 +985,11 @@ jobs:
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.Service
+          import android.content.ClipData
+          import android.content.ClipboardManager
           import android.content.Context
           import android.content.Intent
+          import android.widget.Toast
           import android.content.pm.ServiceInfo
           import android.content.res.Configuration
           import android.graphics.Bitmap
@@ -966,6 +1046,9 @@ jobs:
               private lateinit var floatView: View
               private lateinit var resultText: TextView
               private lateinit var captureButton: Button
+              private lateinit var copyButton: Button
+              // 最近一次展示的答案纯文本（不含颜色 span），供"复制答案"使用
+              @Volatile private var lastAnswerText: String = ""
               private lateinit var overlayParams: WindowManager.LayoutParams
               private lateinit var db: QaDb
               private lateinit var mainHandler: Handler
@@ -1169,14 +1252,30 @@ jobs:
                       setBackgroundColor(COLOR_PRIMARY)
                       setOnClickListener { captureScreen() }
                   }
+                  // "复制答案"按钮：悬浮窗为 FLAG_NOT_FOCUSABLE，TextView 直接开启可选中会与拖动/触摸
+                  // 冲突，因此用独立的复制按钮把最近一次答案写入系统剪贴板，稳定且零焦点副作用。
+                  copyButton = Button(this).apply {
+                      text = "复制答案"
+                      setTextColor(COLOR_PRIMARY)
+                      textSize = 14f
+                      setBackgroundColor(0xFFE8F0FE.toInt())
+                      setOnClickListener { copyAnswerToClipboard() }
+                  }
                   val captureWrap = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
                       setPadding(dp(12), dp(10), dp(12), dp(14))
                       addView(
                           captureButton,
                           LinearLayout.LayoutParams(
-                              LinearLayout.LayoutParams.MATCH_PARENT,
-                              LinearLayout.LayoutParams.WRAP_CONTENT
+                              0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
                           )
+                      )
+                      addView(
+                          copyButton,
+                          LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.WRAP_CONTENT,
+                              LinearLayout.LayoutParams.WRAP_CONTENT
+                          ).apply { leftMargin = dp(8) }
                       )
                   }
           
@@ -1449,7 +1548,7 @@ jobs:
           
                       if (questions.size == 1) {
                           answerOne(questions[0]) { ans ->
-                              setResult(ans)
+                              setResult(ans, isAnswer = true)
                               finishFlow()
                           }
                           return
@@ -1464,7 +1563,7 @@ jobs:
                               results[i] = "【第${i + 1}题】\n$ans"
                               val left = remaining.decrementAndGet()
                               if (left == 0) {
-                                  setResult(results.joinToString("\n\n────────────────\n\n"))
+                                  setResult(results.joinToString("\n\n────────────────\n\n"), isAnswer = true)
                                   finishFlow()
                               } else {
                                   setResult("已解答 ${questions.size - left}/${questions.size} 题…")
@@ -1486,7 +1585,8 @@ jobs:
                   try {
                       val local = runCatching { db.search(question) }.getOrNull()
                       if (local != null) {
-                          callback("【答案】\n${TextCleaner.clean(local).trim()}")
+                          // 标明来源来自题库：配置了 AI Key 却本地命中时，用户能看清本次走的是题库而非 AI
+                          callback("【题库】\n【答案】\n${TextCleaner.clean(local).trim()}")
                           return
                       }
                       if (!AiClient.isConfigured(this)) {
@@ -1515,11 +1615,13 @@ jobs:
           
               // ---------------- 结果展示（答案蓝色加粗、解析灰色） ----------------
           
-              private fun setResult(text: String) {
+              private fun setResult(text: String, isAnswer: Boolean = false) {
                   // 显式 () -> Unit：if 分支末值是 onFailure 返回的 Result，else 分支是赋值，
                   // 不显式声明会被 K2 推断成 () -> Any，导致 mainHandler.post 报类型不匹配。
                   val task: () -> Unit = {
                       val cleaned = runCatching { TextCleaner.clean(text) }.getOrDefault(text)
+                      // 只记录真正的答案，不记录"识别中…"等状态文本，避免复制到状态文字
+                      if (isAnswer) lastAnswerText = cleaned
                       if (::resultText.isInitialized) {
                           runCatching { resultText.text = styleText(cleaned) }
                               .onFailure { runCatching { resultText.text = cleaned } }
@@ -1532,6 +1634,27 @@ jobs:
                       task()
                   } else {
                       mainHandler.post(Runnable { task() })
+                  }
+              }
+          
+              /** 把最近一次答案写入系统剪贴板，并给出可见提示（悬浮窗无焦点，Toast 仍可正常显示）。 */
+              private fun copyAnswerToClipboard() {
+                  val text = lastAnswerText.trim()
+                  if (text.isEmpty()) {
+                      runCatching { Toast.makeText(applicationContext, "暂无可复制的答案", Toast.LENGTH_SHORT).show() }
+                      return
+                  }
+                  val copied = runCatching {
+                      val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("ScreenQA 答案", text))
+                      true
+                  }.getOrDefault(false)
+                  runCatching {
+                      Toast.makeText(
+                          applicationContext,
+                          if (copied) "答案已复制" else "复制失败，请重试",
+                          Toast.LENGTH_SHORT
+                      ).show()
                   }
               }
           
