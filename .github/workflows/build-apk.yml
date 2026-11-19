@@ -61,8 +61,8 @@ jobs:
                   minSdk = 29              // Android 10+
                   targetSdk = 35
                   multiDexEnabled = true  // PDFBox 类较多；minSdk>=21 原生支持，无需 multidex 依赖库
-                  versionCode = 5
-                  versionName = "2.3"
+                  versionCode = 7
+                  versionName = "2.5"
                   buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekKey\"")
               }
           
@@ -323,40 +323,64 @@ jobs:
                       })
                   }.toString()
           
-                  val request = Request.Builder()
-                      .url(url)
-                      .header("Authorization", "Bearer $key")
-                      .post(requestBody.toRequestBody("application/json; charset=utf-8".toMediaType()))
-                      .build()
+                  // 自定义服务商可能填了非法地址（缺 http:// 、含空格等），url() 会抛异常。
+                  // 就地转成可读提示，避免冒泡到调用方显示为不准确的「本地解析异常」。
+                  val request = try {
+                      Request.Builder()
+                          .url(url)
+                          .header("Authorization", "Bearer $key")
+                          .post(requestBody.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                          .build()
+                  } catch (t: Throwable) {
+                      callback("接口地址格式有误（${provider.name}）：${t.message ?: url}")
+                      return
+                  }
           
                   client.newCall(request).enqueue(object : Callback {
                       override fun onFailure(call: Call, e: IOException) {
-                          callback("AI 请求失败（${provider.name}）：${e.message ?: "网络异常，请检查网络"}")
+                          runCatching {
+                              callback("AI 请求失败（${provider.name}）：${e.message ?: "网络异常，请检查网络"}")
+                          }
                       }
           
                       override fun onResponse(call: Call, response: Response) {
-                          response.use { resp ->
-                              // 显式按 UTF-8 解码，避免依赖响应头 charset 缺失时的乱码
-                              val body = resp.body?.bytes()?.let { String(it, Charsets.UTF_8) }.orEmpty()
-                              val answer = if (!resp.isSuccessful) {
-                                  val hint = httpErrorHint(resp.code, body)
-                                  "AI 接口 HTTP ${resp.code}（${provider.name}）：$hint"
-                              } else {
-                                  try {
-                                      val msg = JSONObject(body)
-                                          .getJSONArray("choices")
-                                          .getJSONObject(0)
-                                          .getJSONObject("message")
-                                      // 部分推理模型把正文放在 content，思考过程在 reasoning_content；
-                                      // 这里只取 content（答案），避免解析过程混入。
-                                      val content = msg.optString("content", "")
-                                      TextCleaner.cleanAnswer(content)
-                                          .ifEmpty { "AI 返回空内容（可接受模型名是否正确）" }
-                                  } catch (e: Exception) {
-                                      "解析失败（${provider.name}）：${TextCleaner.clean(body).take(200)}"
+                          var delivered = false
+                          try {
+                              response.use { resp ->
+                                  // 显式按 UTF-8 解码，避免依赖响应头 charset 缺失时的乱码。
+                                  // 读取响应流可能因网络中断抛异常，兜底为空串继续走可读的错误提示。
+                                  val body = runCatching {
+                                      resp.body?.bytes()?.let { String(it, Charsets.UTF_8) }.orEmpty()
+                                  }.getOrDefault("")
+                                  val answer = if (!resp.isSuccessful) {
+                                      val hint = httpErrorHint(resp.code, body)
+                                      "AI 接口 HTTP ${resp.code}（${provider.name}）：$hint"
+                                  } else {
+                                      try {
+                                          val msg = JSONObject(body)
+                                              .getJSONArray("choices")
+                                              .getJSONObject(0)
+                                              .getJSONObject("message")
+                                          // 部分推理模型把正文放在 content，思考过程在 reasoning_content；
+                                          // 这里只取 content（答案），避免解析过程混入。
+                                          val content = msg.optString("content", "")
+                                          TextCleaner.cleanAnswer(content)
+                                              .ifEmpty { "AI 返回空内容（请检查模型名是否正确）" }
+                                      } catch (t: Throwable) {
+                                          "解析失败（${provider.name}）：${TextCleaner.clean(body).take(200)}"
+                                      }
+                                  }
+                                  delivered = true
+                                  callback(answer)
+                              }
+                          } catch (t: Throwable) {
+                              // 流读取 / close 等遗漏异常在这里兜住，保证 callback 恰好返回一次；
+                              // 否则上层 answerOne 的多题计数不会归零，按钮要等 90 秒兜底才恢复。
+                              if (!delivered) {
+                                  runCatching {
+                                      callback("AI 响应异常（${provider.name}）：${t.javaClass.simpleName}：${t.message ?: "未知原因"}")
                                   }
                               }
-                              callback(answer)
                           }
                       }
                   })
@@ -1443,7 +1467,7 @@ jobs:
                           return
                       }
                       if (!AiClient.isConfigured(this)) {
-                          callback("【答案】\n题库未命中，且未配置 API Key（打开 App 填写 DeepSeek Key 后可 AI 解答）")
+                          callback("【答案】\n题库未命中，且未配置 API Key（打开 App 选择 AI 服务商并填写对应 Key 后可 AI 解答）")
                           return
                       }
                       AiClient.ask(this, question) { ans ->
@@ -2077,10 +2101,13 @@ jobs:
                   val overlay = Settings.canDrawOverlays(this)
                   val notify = !notificationsDenied()
                   val key = AiClient.isConfigured(this)
+                  // 注意：buildString 的 receiver 是 StringBuilder，lambda 内的 this 不是 Activity。
+                  // 凡是接受 Context 的调用必须在 lambda 外先算好，避免把 StringBuilder 当 Context 传。
+                  val providerName = AiClient.findProvider(AiClient.currentId(this)).name
                   statusText.text = buildString {
                       append("悬浮窗权限：").append(if (overlay) "已开启" else "未开启").append('\n')
                       append("通知权限：").append(if (notify) "已开启" else "未开启").append('\n')
-                      append("AI 服务：").append(AiClient.findProvider(AiClient.currentId(this)).name)
+                      append("AI 服务：").append(providerName)
                           .append("，Key ").append(if (key) "已配置" else "未配置（仅题库可用）")
                       append("\n")
                       append(if (overlay && notify) "可以点第 ② 步启动了。" else "请先完成上面的权限开启。")
