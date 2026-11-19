@@ -61,8 +61,8 @@ jobs:
                   minSdk = 29              // Android 10+
                   targetSdk = 35
                   multiDexEnabled = true  // PDFBox 类较多；minSdk>=21 原生支持，无需 multidex 依赖库
-                  versionCode = 4
-                  versionName = "2.2"
+                  versionCode = 5
+                  versionName = "2.3"
                   buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekKey\"")
               }
           
@@ -171,15 +171,45 @@ jobs:
           import java.util.concurrent.TimeUnit
           
           /**
-           * AI 兜底：DeepSeek（兼容 OpenAI chat/completions 格式）。
-           * Key 优先取手机上 App 内填写的值，其次取构建时注入的 BuildConfig 值。
-           * 回调在 OkHttp 的工作线程执行，调用方需自行切回主线程更新 UI。
+           * AI 兜底：统一走 OpenAI-compatible 的 chat/completions 协议。
+           * 主流服务商（OpenAI / DeepSeek / 通义 / GLM / Kimi / 豆包 / MiniMax / 文心 / Gemini 等）
+           * 都提供兼容接口，只改 base URL + 模型名 + Key 即可，因此这里做成"预设 + 自定义"。
+           *
+           * 配置全部保存在手机本机 SharedPreferences：每个服务商的 Key、URL、模型名独立保存，
+           * 切换服务商不会互相覆盖。回调在 OkHttp 工作线程执行，调用方需自行切回主线程更新 UI。
            */
           object AiClient {
           
-              private const val URL = "https://api.deepseek.com/chat/completions"
+              /** 一个服务商预设：id 唯一；url 为完整的 chat/completions 地址；model 为默认模型 */
+              data class Provider(
+                  val id: String,
+                  val name: String,
+                  val url: String,
+                  val model: String,
+                  val note: String = ""
+              )
+          
+              // 默认模型名只作参考，用户在 App 内可随时改（模型迭代很快，写死容易失效）
+              val PRESETS: List<Provider> = listOf(
+                  Provider("deepseek", "DeepSeek", "https://api.deepseek.com/chat/completions", "deepseek-v4-flash", "国内直连，性价比高"),
+                  Provider("openai", "OpenAI", "https://api.openai.com/v1/chat/completions", "gpt-4o-mini", "需能访问 OpenAI"),
+                  Provider("qwen", "通义千问", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen-plus", "阿里云百炼兼容模式"),
+                  Provider("glm", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4/chat/completions", "glm-4-flash", "glm-4-flash 免费"),
+                  Provider("kimi", "Kimi", "https://api.moonshot.cn/v1/chat/completions", "moonshot-v1-8k", "月之暗面"),
+                  Provider("doubao", "豆包（火山方舟）", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "", "模型名需填方舟创建的端点 ID（ep-xxx）"),
+                  Provider("minimax", "MiniMax", "https://api.minimax.chat/v1/chat/completions", "MiniMax-Text-01", ""),
+                  Provider("ernie", "百度文心", "https://qianfan.baidubce.com/v2/chat/completions", "ernie-4.0-8k", "千帆 v2 兼容模式"),
+                  Provider("gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-2.0-flash", "OpenAI 兼容端点"),
+                  Provider("custom", "自定义（OpenAI 兼容）", "", "", "自行填写完整接口地址与模型名")
+              )
+          
               private const val PREF_NAME = "screenqa_prefs"
-              private const val PREF_KEY = "deepseek_api_key"
+              private const val PREF_PROVIDER = "ai_provider_id"
+              private const val PREF_KEY_PREFIX = "ai_key_"
+              private const val PREF_URL_PREFIX = "ai_url_"
+              private const val PREF_MODEL_PREFIX = "ai_model_"
+              // 旧版 DeepSeek Key 的存储名，用于迁移，避免老用户升级后 Key 丢失
+              private const val LEGACY_KEY = "deepseek_api_key"
           
               private val client = OkHttpClient.Builder()
                   .connectTimeout(15, TimeUnit.SECONDS)
@@ -187,31 +217,93 @@ jobs:
                   .writeTimeout(30, TimeUnit.SECONDS)
                   .build()
           
-              fun readKey(context: Context): String =
+              private fun prefs(context: Context) =
                   context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-                      .getString(PREF_KEY, null)
-                      ?.takeIf { it.isNotBlank() }
-                      ?: BuildConfig.DEEPSEEK_API_KEY
           
-              fun saveKey(context: Context, key: String) {
-                  context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-                      .edit()
-                      .putString(PREF_KEY, key.trim())
-                      .apply()
+              fun providers(): List<Provider> = PRESETS
+          
+              fun findProvider(id: String): Provider = PRESETS.firstOrNull { it.id == id } ?: PRESETS[0]
+          
+              fun currentId(context: Context): String =
+                  prefs(context).getString(PREF_PROVIDER, null)?.takeIf { it.isNotBlank() } ?: "deepseek"
+          
+              fun setProvider(context: Context, id: String) {
+                  prefs(context).edit().putString(PREF_PROVIDER, id).apply()
+              }
+          
+              fun currentProvider(context: Context): Provider = findProvider(currentId(context))
+          
+              /** 当前服务商生效的 Key：自定义保存值优先，DeepSeek 兼容旧 Key 与构建注入值 */
+              fun readKey(context: Context): String = readKeyFor(context, currentId(context))
+          
+              fun readKeyFor(context: Context, id: String): String {
+                  val p = prefs(context)
+                  val saved = p.getString(PREF_KEY_PREFIX + id, null)?.takeIf { it.isNotBlank() }
+                  if (saved != null) return saved
+                  if (id == "deepseek") {
+                      val legacy = p.getString(LEGACY_KEY, null)?.takeIf { it.isNotBlank() }
+                      if (legacy != null) return legacy
+                      if (BuildConfig.DEEPSEEK_API_KEY.isNotBlank()) return BuildConfig.DEEPSEEK_API_KEY
+                  }
+                  return ""
+              }
+          
+              /** 兼容旧调用：保存到当前服务商 */
+              fun saveKey(context: Context, key: String) = saveKeyFor(context, currentId(context), key)
+          
+              fun saveKeyFor(context: Context, id: String, key: String) {
+                  prefs(context).edit().putString(PREF_KEY_PREFIX + id, key.trim()).apply()
+              }
+          
+              /** 生效的接口地址：自定义保存值优先，否则用预设 */
+              fun readUrl(context: Context): String = readUrlFor(context, currentId(context))
+          
+              fun readUrlFor(context: Context, id: String): String {
+                  val saved = prefs(context).getString(PREF_URL_PREFIX + id, null)
+                  return if (!saved.isNullOrBlank()) saved.trim() else findProvider(id).url
+              }
+          
+              fun saveUrlFor(context: Context, id: String, url: String) {
+                  prefs(context).edit().putString(PREF_URL_PREFIX + id, url.trim()).apply()
+              }
+          
+              /** 生效的模型名：自定义保存值优先，否则用预设 */
+              fun readModel(context: Context): String = readModelFor(context, currentId(context))
+          
+              fun readModelFor(context: Context, id: String): String {
+                  val saved = prefs(context).getString(PREF_MODEL_PREFIX + id, null)
+                  return if (!saved.isNullOrBlank()) saved.trim() else findProvider(id).model
+              }
+          
+              fun saveModelFor(context: Context, id: String, model: String) {
+                  prefs(context).edit().putString(PREF_MODEL_PREFIX + id, model.trim()).apply()
               }
           
               fun isConfigured(context: Context): Boolean = readKey(context).isNotBlank()
           
               fun ask(context: Context, question: String, callback: (String) -> Unit) {
-                  val key = readKey(context)
+                  val id = currentId(context)
+                  val provider = findProvider(id)
+                  val key = readKeyFor(context, id)
+                  val url = readUrlFor(context, id)
+                  val model = readModelFor(context, id)
+          
                   if (key.isBlank()) {
-                      callback("未配置 API Key：请打开 App 填写并保存 DeepSeek Key。题库命中不受影响。")
+                      callback("未配置 API Key：请在 App 内为「${provider.name}」填写并保存 Key。题库命中不受影响。")
+                      return
+                  }
+                  if (url.isBlank()) {
+                      callback("未配置接口地址：请为「${provider.name}」填写完整的 chat/completions 地址。")
+                      return
+                  }
+                  if (model.isBlank()) {
+                      callback("未配置模型名：请为「${provider.name}」填写模型名（豆包需填端点 ID）。")
                       return
                   }
           
                   // 用 JSONObject 构造请求体，避免手工拼接 JSON 时的转义问题
                   val requestBody = JSONObject().apply {
-                      put("model", "deepseek-v4-flash") // 旧名 deepseek-chat 已于 2026-07 停用，v4-flash 是其对应型号
+                      put("model", model)
                       put("temperature", 0)
                       put("messages", JSONArray().apply {
                           put(JSONObject().apply {
@@ -232,14 +324,14 @@ jobs:
                   }.toString()
           
                   val request = Request.Builder()
-                      .url(URL)
+                      .url(url)
                       .header("Authorization", "Bearer $key")
                       .post(requestBody.toRequestBody("application/json; charset=utf-8".toMediaType()))
                       .build()
           
                   client.newCall(request).enqueue(object : Callback {
                       override fun onFailure(call: Call, e: IOException) {
-                          callback("AI 请求失败：${e.message ?: "网络异常，请检查网络"}")
+                          callback("AI 请求失败（${provider.name}）：${e.message ?: "网络异常，请检查网络"}")
                       }
           
                       override fun onResponse(call: Call, response: Response) {
@@ -247,25 +339,46 @@ jobs:
                               // 显式按 UTF-8 解码，避免依赖响应头 charset 缺失时的乱码
                               val body = resp.body?.bytes()?.let { String(it, Charsets.UTF_8) }.orEmpty()
                               val answer = if (!resp.isSuccessful) {
-                                  "AI 接口 HTTP ${resp.code}：${TextCleaner.clean(body).take(200)}"
+                                  val hint = httpErrorHint(resp.code, body)
+                                  "AI 接口 HTTP ${resp.code}（${provider.name}）：$hint"
                               } else {
                                   try {
-                                      val content = JSONObject(body)
+                                      val msg = JSONObject(body)
                                           .getJSONArray("choices")
                                           .getJSONObject(0)
                                           .getJSONObject("message")
-                                          .getString("content")
-                                      // 清洗 BOM/零宽字符/Markdown 符号，保留【答案】【解析】结构
+                                      // 部分推理模型把正文放在 content，思考过程在 reasoning_content；
+                                      // 这里只取 content（答案），避免解析过程混入。
+                                      val content = msg.optString("content", "")
                                       TextCleaner.cleanAnswer(content)
-                                          .ifEmpty { "AI 返回空内容" }
+                                          .ifEmpty { "AI 返回空内容（可接受模型名是否正确）" }
                                   } catch (e: Exception) {
-                                      "解析失败：${TextCleaner.clean(body).take(200)}"
+                                      "解析失败（${provider.name}）：${TextCleaner.clean(body).take(200)}"
                                   }
                               }
                               callback(answer)
                           }
                       }
                   })
+              }
+          
+              /** 把常见 HTTP 错误码翻译成人能看懂的提示，并尽量带出服务商返回的原因 */
+              private fun httpErrorHint(code: Int, body: String): String {
+                  val base = when (code) {
+                      400 -> "请求参数有误（模型名或地址可能不对）"
+                      401 -> "API Key 无效或已过期"
+                      403 -> "无权限访问该模型 / Key 权限不足"
+                      404 -> "接口地址或模型名不存在"
+                      429 -> "请求过于频繁或额度不足"
+                      in 500..599 -> "服务商服务端暂时异常，请稍后重试"
+                      else -> "请求失败"
+                  }
+                  // 尝试从错误 JSON 里取 message 字段，让排查更具体
+                  val detail = runCatching {
+                      JSONObject(body).optJSONObject("error")?.optString("message")
+                          ?.takeIf { it.isNotBlank() }?.take(160)
+                  }.getOrNull()
+                  return if (detail.isNullOrBlank()) base else "$base：$detail"
               }
           }
           SQEOF_5
@@ -301,16 +414,31 @@ jobs:
                   val error: String? = null
               )
           
-              fun import(context: Context, uri: Uri, ext: String): Result {
+              fun import(context: Context, uri: Uri, extHint: String): Result {
                   val bytes = try {
                       context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                   } catch (t: Throwable) {
-                      return Result(emptyList(), 0, friendlyError(t))
-                  } ?: return Result(emptyList(), 0, "无法读取文件")
+                      return Result(
+                          emptyList(), 0,
+                          "读取文件失败：${friendlyError(t)}。若从微信/QQ直接打开，请先「保存到文件」再导入。"
+                      )
+                  } ?: return Result(emptyList(), 0, "无法读取文件内容（来源：${uri.scheme ?: "未知"}）")
                   if (bytes.isEmpty()) return Result(emptyList(), 0, "文件为空")
                   // 防 OOM：整个文件会读进内存，超大文件直接拒绝
                   if (bytes.size > MAX_FILE_BYTES) {
                       return Result(emptyList(), 0, "文件过大（${bytes.size / 1048576}MB），请拆分后导入（上限 ${MAX_FILE_BYTES / 1048576}MB）")
+                  }
+          
+                  // 关键：文件名扩展名只当"提示"，最终以 MIME + 文件头嗅探为准。
+                  // 从微信/QQ/第三方文件管理器选文件时经常拿不到文件名或扩展名是错的，
+                  // 以前直接凭扩展名判断，拿不到就报"不支持的格式"——这正是"无法导入"的根因。
+                  val ext = resolveExt(context, uri, bytes, extHint)
+                  if (ext == "?") {
+                      return Result(
+                          emptyList(), 0,
+                          "无法识别文件格式（扩展名：${extHint.ifEmpty { "无" }}，已读取 ${bytes.size} 字节）。" +
+                              "请确认文件未损坏，支持 txt/csv/docx/pptx/xlsx/pdf。"
+                      )
                   }
           
                   return try {
@@ -329,6 +457,52 @@ jobs:
                       // 捕获 Throwable 而非 Exception：OOM 等 Error 也要兜住，避免导入时闪退
                       Result(emptyList(), 0, friendlyError(t))
                   }
+              }
+          
+              private val SUPPORTED_EXTS = setOf("txt", "csv", "tsv", "xlsx", "docx", "pptx", "pdf")
+          
+              /** 扩展名提示 → MIME → 文件头嗅探，返回真实格式；无法判断返回 "?" */
+              private fun resolveExt(context: Context, uri: Uri, bytes: ByteArray, hint: String): String {
+                  val h = hint.lowercase().trim().removePrefix(".")
+                  if (h in SUPPORTED_EXTS) return h
+          
+                  val mime = runCatching { context.contentResolver.getType(uri)?.lowercase() }.getOrNull()
+                  if (!mime.isNullOrBlank()) {
+                      val guessed = when {
+                          mime.contains("wordprocessingml") || mime.contains("msword") -> "docx"
+                          mime.contains("presentationml") || mime.contains("ms-powerpoint") -> "pptx"
+                          mime.contains("spreadsheetml") || mime.contains("ms-excel") -> "xlsx"
+                          mime.contains("pdf") -> "pdf"
+                          mime.contains("csv") -> "csv"
+                          mime.contains("tab-separated") -> "tsv"
+                          mime.contains("text/plain") -> "txt"
+                          else -> ""
+                      }
+                      if (guessed.isNotEmpty()) return guessed
+                  }
+                  return sniffExt(bytes)
+              }
+          
+              /** 按文件头判断真实格式：ZIP 家族看内部条目名，%PDF 看魔数，其余按纯文本 */
+              private fun sniffExt(bytes: ByteArray): String {
+                  // ZIP 魔数 PK\x03\x04：docx / pptx / xlsx 都是 zip
+                  if (bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte() &&
+                      bytes[2] == 0x03.toByte() && bytes[3] == 0x04.toByte()
+                  ) {
+                      val names = runCatching { unzip(bytes).keys }.getOrDefault(emptySet())
+                      return when {
+                          names.any { it.startsWith("word/") } -> "docx"
+                          names.any { it.startsWith("ppt/") } -> "pptx"
+                          names.any { it.startsWith("xl/") } -> "xlsx"
+                          else -> "?"
+                      }
+                  }
+                  // PDF 魔数 %PDF
+                  if (bytes.size >= 4 && bytes[0] == 0x25.toByte() && bytes[1] == 0x50.toByte() &&
+                      bytes[2] == 0x44.toByte() && bytes[3] == 0x46.toByte()
+                  ) return "pdf"
+                  // 无二进制魔数：当成文本，让 parseLines 尝试按"题目,答案"解析
+                  return "txt"
               }
           
               private fun friendlyError(t: Throwable): String = when (t) {
@@ -409,10 +583,18 @@ jobs:
                   return out
               }
           
-              /** UTF-8 解码；出现替换字符说明是 GBK/ANSI 保存的中文文本，退回 GBK 重解 */
+              /** UTF-8 解码；去 BOM，出现替换字符则用 GBK 重解 */
               private fun decodeText(bytes: ByteArray): String {
-                  val utf8 = String(bytes, Charsets.UTF_8)
-                  return if (utf8.contains('\uFFFD')) String(bytes, charset("GBK")) else utf8
+                  var b = bytes
+                  // 去掉 UTF-8 BOM，否则首行表头会多出不可见字符导致匹配失败
+                  if (b.size >= 3 && b[0] == 0xEF.toByte() && b[1] == 0xBB.toByte() && b[2] == 0xBF.toByte()) {
+                      b = b.copyOfRange(3, b.size)
+                  }
+                  val utf8 = String(b, Charsets.UTF_8)
+                  if (utf8.contains('\uFFFD')) {
+                      return runCatching { String(b, charset("GBK")) }.getOrDefault(utf8).removePrefix("\uFEFF")
+                  }
+                  return utf8
               }
           
               // ---------------- 结构化题库解析（【编程题】/【答案】等标记） ----------------
@@ -514,7 +696,11 @@ jobs:
                               "p" -> {
                                   inPara = true; sb.setLength(0)
                               }
-                              "t" -> if (inPara) sb.append(parser.nextText())
+                              "t" -> if (inPara) {
+                                  // nextText 在某些畸形 XML 上会抛异常，用 text+事件推进更稳
+                                  val t = runCatching { parser.nextText() }.getOrDefault("")
+                                  sb.append(t)
+                              }
                               "tab" -> if (inPara) sb.append('\t')
                               "br" -> if (inPara) sb.append('\n')
                           }
@@ -523,7 +709,7 @@ jobs:
                                   lines += sb.toString(); inPara = false
                               }
                       }
-                      event = parser.next()
+                      event = runCatching { parser.next() }.getOrDefault(XmlPullParser.END_DOCUMENT)
                   }
                   return lines
               }
@@ -1547,10 +1733,16 @@ jobs:
               private lateinit var bankCountText: TextView
               private lateinit var importResultText: TextView
               private lateinit var keyInput: EditText
+              private lateinit var urlInput: EditText
+              private lateinit var modelInput: EditText
+              private lateinit var providerHintText: TextView
               private lateinit var projectionManager: MediaProjectionManager
           
               @Volatile
               private var importing = false
+          
+              /** 当前在 UI 上选中的服务商 id（与 AiClient 的持久化保持一致） */
+              private var selectedProviderId: String = "deepseek"
           
               private val notificationPermission =
                   registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -1663,21 +1855,42 @@ jobs:
                       text = "支持格式与规则见页面底部说明。"
                   }
           
-                  // ---- API Key ----
-                  val keyTitle = sectionTitle("DeepSeek API Key（可选）")
+                  // ---- AI 配置（多服务商）----
+                  val keyTitle = sectionTitle("AI 服务配置（可选，仅题库未命中时才调用）")
+                  selectedProviderId = AiClient.currentId(this)
+                  val chooseProviderButton = Button(this).apply {
+                      text = "选择 AI 服务商（当前：${AiClient.findProvider(selectedProviderId).name}）"
+                      setOnClickListener { showProviderPicker() }
+                  }
+                  providerHintText = TextView(this).apply {
+                      textSize = 12f
+                  }
+                  modelInput = EditText(this).apply {
+                      hint = "模型名（可修改）"
+                      setText(AiClient.readModelFor(this@MainActivity, selectedProviderId))
+                  }
+                  urlInput = EditText(this).apply {
+                      hint = "接口地址（一般无需修改）"
+                      setText(AiClient.readUrlFor(this@MainActivity, selectedProviderId))
+                  }
                   keyInput = EditText(this).apply {
-                      hint = "sk-... 仅 AI 兜底需要，只保存在本机"
+                      hint = "API Key，只保存在本机"
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                      setText(AiClient.readKey(this@MainActivity))
+                      setText(AiClient.readKeyFor(this@MainActivity, selectedProviderId))
                   }
                   val saveKeyButton = Button(this).apply {
-                      text = "保存 Key"
+                      text = "保存当前服务商配置"
                       setOnClickListener {
-                          AiClient.saveKey(this@MainActivity, keyInput.text.toString())
-                          toast("已保存")
+                          val id = selectedProviderId
+                          AiClient.setProvider(this@MainActivity, id)
+                          AiClient.saveKeyFor(this@MainActivity, id, keyInput.text.toString())
+                          AiClient.saveModelFor(this@MainActivity, id, modelInput.text.toString())
+                          AiClient.saveUrlFor(this@MainActivity, id, urlInput.text.toString())
+                          toast("已保存：${AiClient.findProvider(id).name}")
                           refreshStatus()
                       }
                   }
+                  updateProviderHint()
           
                   // ---- 使用说明 ----
                   val helpTitle = sectionTitle("使用说明")
@@ -1691,7 +1904,8 @@ jobs:
                              · docx / pptx / pdf：支持两种写法，自动判断。① 每段一题，用逗号或制表符分隔「题目,答案」；② 结构化题库（如实训报告），用【编程题】【单选题】等标记题目开始、用【答案】【解析】【程序运行示例】等标记答案开始，题目与答案都可以跨多段，会自动逐题配对。
                              · 第一行是「question,answer」或「题目,答案」表头时会自动跳过；同一题目重复导入会覆盖旧答案。
                           3. 题库命中不消耗任何费用；未命中才会调用 AI（需 Key 且按量计费）。
-                          4. 手机重启或 App 被杀后屏幕捕获授权会失效，重开 App 再点一次 ② 即可。
+                          4. AI 支持 OpenAI / DeepSeek / 通义 / GLM / Kimi / 豆包 / MiniMax / 文心 / Gemini 等主流服务，均为 OpenAI 兼容接口。在「选择 AI 服务商」里切换，每个服务商的 Key / 地址 / 模型名独立保存。豆包的模型名要填方舟创建的端点 ID（ep-xxx）。其他兼容接口可选「自定义」并填完整地址。
+                          5. 手机重启或 App 被杀后屏幕捕获授权会失效，重开 App 再点一次 ② 即可。
                       """.trimIndent()
                   }
           
@@ -1707,6 +1921,10 @@ jobs:
                   root.addView(clearButton, lp())
                   root.addView(importResultText, lp())
                   root.addView(keyTitle, lp())
+                  root.addView(chooseProviderButton, lp())
+                  root.addView(providerHintText, lp())
+                  root.addView(modelInput, lp())
+                  root.addView(urlInput, lp())
                   root.addView(keyInput, lp())
                   root.addView(saveKeyButton, lp())
                   root.addView(helpTitle, lp())
@@ -1734,6 +1952,47 @@ jobs:
                       .show()
               }
           
+              // ---------------- AI 服务商选择 ----------------
+          
+              /** 弹出单选列表切换服务商；切换后立即载入该服务商已保存的 Key / 地址 / 模型 */
+              private fun showProviderPicker() {
+                  val providers = AiClient.providers()
+                  val labels = providers.map { p ->
+                      p.name + if (p.note.isNotBlank()) "\n    ${p.note}" else ""
+                  }.toTypedArray()
+                  val checked = providers.indexOfFirst { it.id == selectedProviderId }.coerceAtLeast(0)
+                  AlertDialog.Builder(this)
+                      .setTitle("选择 AI 服务商")
+                      .setSingleChoiceItems(labels, checked) { dialog, which ->
+                          val picked = providers[which]
+                          dialog.dismiss()
+                          // 先把当前输入框里可能未保存的改动落到旧服务商，避免切换丢失
+                          AiClient.saveKeyFor(this, selectedProviderId, keyInput.text.toString())
+                          AiClient.saveModelFor(this, selectedProviderId, modelInput.text.toString())
+                          AiClient.saveUrlFor(this, selectedProviderId, urlInput.text.toString())
+          
+                          selectedProviderId = picked.id
+                          AiClient.setProvider(this, picked.id)
+                          keyInput.setText(AiClient.readKeyFor(this, picked.id))
+                          modelInput.setText(AiClient.readModelFor(this, picked.id))
+                          urlInput.setText(AiClient.readUrlFor(this, picked.id))
+                          updateProviderHint()
+                          refreshStatus()
+                      }
+                      .setNegativeButton("取消", null)
+                      .show()
+              }
+          
+              /** 更新服务商下方的说明文字（含当前生效地址，方便核对自定义端点） */
+              private fun updateProviderHint() {
+                  val p = AiClient.findProvider(selectedProviderId)
+                  val url = AiClient.readUrlFor(this, selectedProviderId)
+                  providerHintText.text = buildString {
+                      if (p.note.isNotBlank()) append(p.note).append('\n')
+                      append("接口：").append(if (url.isNotBlank()) url else "未填写")
+                  }
+              }
+          
               // ---------------- 导入 ----------------
           
               private fun importFile(uri: Uri) {
@@ -1741,13 +2000,10 @@ jobs:
                       toast("正在导入中，请稍候")
                       return
                   }
-                  val name = queryDisplayName(uri) ?: "未知文件"
+                  val name = queryDisplayName(uri) ?: uri.lastPathSegment ?: "所选文件"
+                  // 扩展名只是"提示"：拿不到或不对时传空串，由 BankImporter 用 MIME + 文件头嗅探兜底。
+                  // 不再因为取不到文件名就直接判"不支持的格式"（微信/第三方文件管理器常见）。
                   val ext = name.substringAfterLast('.', "").lowercase()
-                  val supported = listOf("txt", "csv", "tsv", "xlsx", "docx", "pptx", "pdf")
-                  if (ext !in supported) {
-                      importResultText.text = "不支持的格式：.$ext\n支持：${supported.joinToString(" / ")}"
-                      return
-                  }
                   importing = true
                   importResultText.text = "正在导入 $name ..."
                   thread {
@@ -1824,7 +2080,8 @@ jobs:
                   statusText.text = buildString {
                       append("悬浮窗权限：").append(if (overlay) "已开启" else "未开启").append('\n')
                       append("通知权限：").append(if (notify) "已开启" else "未开启").append('\n')
-                      append("API Key：").append(if (key) "已配置" else "未配置（仅题库可用）")
+                      append("AI 服务：").append(AiClient.findProvider(AiClient.currentId(this)).name)
+                          .append("，Key ").append(if (key) "已配置" else "未配置（仅题库可用）")
                       append("\n")
                       append(if (overlay && notify) "可以点第 ② 步启动了。" else "请先完成上面的权限开启。")
                   }
