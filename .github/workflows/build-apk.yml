@@ -61,8 +61,8 @@ jobs:
                   minSdk = 29              // Android 10+
                   targetSdk = 35
                   multiDexEnabled = true  // PDFBox 类较多；minSdk>=21 原生支持，无需 multidex 依赖库
-                  versionCode = 9
-                  versionName = "2.7"
+                  versionCode = 10
+                  versionName = "2.8"
                   buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekKey\"")
               }
           
@@ -1005,6 +1005,7 @@ jobs:
           import android.os.IBinder
           import android.os.Looper
           import android.text.Selection
+          import android.text.Spannable
           import android.text.SpannableStringBuilder
           import android.text.Spanned
           import android.text.style.ForegroundColorSpan
@@ -1670,8 +1671,11 @@ jobs:
               /** 正确清除 TextView 的选区高亮：Selection 由 android.text.Selection 管理，clearFocus 清不掉。 */
               private fun clearTextSelection() {
                   runCatching {
-                      if (::resultText.isInitialized && resultText.text is SpannableStringBuilder) {
-                          Selection.removeSelection(resultText.text)
+                      if (::resultText.isInitialized) {
+                          // 必须先存局部变量再 is 检查：Kotlin 不会对属性访问(resultText.text)做智能转换，
+                          // 直接传 resultText.text 会被推断为 CharSequence!，无法作为 Spannable 传入。
+                          val sp = resultText.text
+                          if (sp is Spannable) Selection.removeSelection(sp)
                       }
                   }
               }
