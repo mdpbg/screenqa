@@ -61,8 +61,8 @@ jobs:
                   minSdk = 29              // Android 10+
                   targetSdk = 35
                   multiDexEnabled = true  // PDFBox 类较多；minSdk>=21 原生支持，无需 multidex 依赖库
-                  versionCode = 7
-                  versionName = "2.5"
+                  versionCode = 8
+                  versionName = "2.6"
                   buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekKey\"")
               }
           
@@ -626,63 +626,86 @@ jobs:
               // 答案/解析段标记：【答案】【解析】【程序运行示例】【参考答案】或"答案：""解析："开头
               private val ANSWER_MARK =
                   Regex("【[^】]*(答案|解析|运行示例)[^】]*】|^(答案|解析|参考答案)\\s*[:：]")
-              // 题目段标记：【编程题】【改错题】【单选题】等含"题"；或【编程示例】（不含"运行"，避免与运行示例冲突）
-              private val QUESTION_MARK =
-                  Regex("【[^】]*题[^】]*】|【(?![^】]*运行)[^】]*示例[^】]*】")
+              // 题型标记（用于判定"题目起点"）：涵盖 题/示例/优化/改错/填空/选择/判断/简答，
+              // 并排除独立的答案标记行（如单独的【程序运行示例】不是题目起点）。
+              private val QUESTION_TYPE_MARK =
+                  Regex("【[^】]*(题|示例|优化|改错|填空|选择|判断|简答)[^】]*】")
+              // 题目之间的分隔线（如一串 ====）：遇到即结束当前答案区，避免吞入后续内容。
+              private val SECTION_SEPARATOR = Regex("^=+\\s*$")
           
               /** 统一入口：含结构化标记用段落状态机，否则用"题目,答案"简单格式 */
               fun parseParagraphs(lines: List<String>): Result {
                   val cleaned = lines.map { TextCleaner.clean(it).trim() }
                   val structured = cleaned.any {
-                      QUESTION_MARK.containsMatchIn(it) || ANSWER_MARK.containsMatchIn(it)
+                      QUESTION_TYPE_MARK.containsMatchIn(it) || ANSWER_MARK.containsMatchIn(it)
                   }
                   return if (structured) parseStructured(cleaned) else parseLines(cleaned)
               }
           
               /**
-               * 段落状态机：识别"【题型】题目"段与"【答案/解析/运行示例】"段，
-               * 题目可跨多段、答案可跨多段，读到下一题时结算上一题。
-               * 实测对《实训报告-设计模块化程序》这类结构化题库能正确配对 7 题。
+               * 结构化题库分段解析（诊断修复版）。
+               *
+               * 真实的实训报告类文档有两个区域：
+               *  1) "实验内容"题目清单：连续多个【编程题】，只有题干没有答案；
+               *  2) "报告内容"正文：同样这些题，每题后跟【程序运行示例】等答案。
+               * 旧状态机从文档开头连续扫描，把清单区的题也卷入，导致题目数量、配对错位，
+               * 且无答案的题（如【AI优化】）被丢弃、上一题答案吞入下一题题干。
+               *
+               * 新算法：
+               *  - 先按"题目起点"把所有段落切成若干段（每段 = 题目标记行 + 后续内容）；
+               *  - 每段内部分出题干与答案（答案从 ANSWER_MARK 开始，遇分隔线结束）；
+               *  - 以"第一个含答案标记的段"作为正文区起点，跳过其前的纯清单区；
+               *  - 正文区每段都保留；无答案的题用占位文案（可交给 AI 解答）。
                */
               private fun parseStructured(lines: List<String>): Result {
-                  val pairs = mutableListOf<Pair<String, String>>()
-                  val q = StringBuilder()
-                  val a = StringBuilder()
-                  var inAnswer = false
-                  var hasQuestion = false
+                  fun isQuestionStart(line: String): Boolean =
+                      QUESTION_TYPE_MARK.containsMatchIn(line) &&
+                          line.length > 8 && !ANSWER_MARK.containsMatchIn(line)
           
-                  fun flush() {
-                      val qt = q.toString().trim()
-                      val at = a.toString().trim()
-                      if (qt.isNotEmpty() && at.isNotEmpty()) pairs += qt to at
-                      q.clear(); a.clear(); inAnswer = false
-                  }
+                  val starts = lines.indices.filter { isQuestionStart(lines[it]) }
+                  if (starts.isEmpty()) return Result(emptyList(), 0)
           
-                  for (raw in lines) {
-                      val line = raw.trim()
-                      if (line.isEmpty()) continue
-                      when {
-                          ANSWER_MARK.containsMatchIn(line) && hasQuestion -> {
+                  data class Seg(val question: String, val answer: String, val hasAnswerMark: Boolean)
+                  val segs = mutableListOf<Seg>()
+                  for (k in starts.indices) {
+                      val from = starts[k]
+                      val to = if (k + 1 < starts.size) starts[k + 1] else lines.size
+                      val body = lines.subList(from, to)
+                      val q = StringBuilder().append(body[0])
+                      val a = StringBuilder()
+                      var inAnswer = false
+                      var marked = false
+                      for (i in 1 until body.size) {
+                          val line = body[i]
+                          if (line.isEmpty()) continue
+                          if (SECTION_SEPARATOR.containsMatchIn(line)) {
+                              inAnswer = false
+                              continue
+                          }
+                          if (ANSWER_MARK.containsMatchIn(line)) {
+                              marked = true
                               inAnswer = true
                               val after = line.replace(ANSWER_MARK, "").trim()
                               if (after.isNotEmpty()) a.append(after).append('\n')
+                              continue
                           }
-                          QUESTION_MARK.containsMatchIn(line) -> {
-                              flush()
-                              q.append(line).append('\n')
-                              hasQuestion = true
-                              inAnswer = false
-                          }
-                          else -> {
-                              if (!hasQuestion) continue  // 跳过文档头部（封面/说明）
-                              if (inAnswer) a.append(line).append('\n') else q.append(line).append('\n')
-                          }
+                          if (inAnswer) a.append(line).append('\n') else q.append(line).append('\n')
                       }
+                      segs += Seg(q.toString().trim(), a.toString().trim(), marked)
                   }
-                  flush()
-                  // 过滤过短的误识别题目
-                  val filtered = pairs.filter { it.first.length >= 4 }
-                  return Result(filtered, 0)
+          
+                  // 第一个带答案标记的段 = 正文区起点；其前是"题目清单"，跳过避免重复与错位。
+                  // 若整份文档都没有答案标记（纯题目清单），则从第 0 段开始全部保留。
+                  val firstMarkedIdx = segs.indexOfFirst { it.hasAnswerMark }
+                  val firstMarked = if (firstMarkedIdx < 0) 0 else firstMarkedIdx
+                  val pairs = mutableListOf<Pair<String, String>>()
+                  for (i in firstMarked until segs.size) {
+                      val s = segs[i]
+                      if (s.question.length < 4) continue
+                      val answer = if (s.answer.isNotEmpty()) s.answer else "（本题无参考答案，可用 AI 解答）"
+                      pairs += s.question to answer
+                  }
+                  return Result(pairs, 0)
               }
           
               // ---------------- zip/XML 系（docx / pptx / xlsx） ----------------
@@ -1925,7 +1948,7 @@ jobs:
                           2. 导入题库的文件内容规则：
                              · txt / csv：每行一题，题目和答案用英文逗号、制表符或中文逗号分隔，例如「中国的首都,北京」；含逗号的字段用英文双引号包裹。
                              · xlsx：第一个工作表，A 列题目、B 列答案。
-                             · docx / pptx / pdf：支持两种写法，自动判断。① 每段一题，用逗号或制表符分隔「题目,答案」；② 结构化题库（如实训报告），用【编程题】【单选题】等标记题目开始、用【答案】【解析】【程序运行示例】等标记答案开始，题目与答案都可以跨多段，会自动逐题配对。
+                             · docx / pptx / pdf：支持两种写法，自动判断。① 每段一题，用逗号或制表符分隔「题目,答案」；② 结构化题库（如实训报告），用【编程题】【单选题】【AI优化】等标记题目开始、用【答案】【解析】【程序运行示例】等标记答案开始，题目与答案都可以跨多段，会自动逐题配对。文档里若先列一遍题目清单、再在正文给带答案的版本，清单会自动跳过只保留正文；只给题干没给答案的题会保留题干并标注「可用 AI 解答」。
                              · 第一行是「question,answer」或「题目,答案」表头时会自动跳过；同一题目重复导入会覆盖旧答案。
                           3. 题库命中不消耗任何费用；未命中才会调用 AI（需 Key 且按量计费）。
                           4. AI 支持 OpenAI / DeepSeek / 通义 / GLM / Kimi / 豆包 / MiniMax / 文心 / Gemini 等主流服务，均为 OpenAI 兼容接口。在「选择 AI 服务商」里切换，每个服务商的 Key / 地址 / 模型名独立保存。豆包的模型名要填方舟创建的端点 ID（ep-xxx）。其他兼容接口可选「自定义」并填完整地址。
