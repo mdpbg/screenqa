@@ -61,8 +61,8 @@ jobs:
                   minSdk = 29              // Android 10+
                   targetSdk = 35
                   multiDexEnabled = true  // PDFBox 类较多；minSdk>=21 原生支持，无需 multidex 依赖库
-                  versionCode = 10
-                  versionName = "2.8"
+                  versionCode = 11
+                  versionName = "2.9"
                   buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekKey\"")
               }
           
@@ -639,8 +639,13 @@ jobs:
               private val NUMBERED_QUESTION_START = Regex("^\\d{1,4}\\s*[、.．]")   // 题号起点
               // 答案标记：兼容"答案：""正确答案：""参考答案："，冒号后内容即答案首行
               private val NUMBERED_ANSWER_MARK = Regex("^\\s*(正确答案|参考答案|答案)\\s*[:：]\\s*(.*)$")
-              // 解析标记：兼容"解析：""答案解析：""【解析】"
+              // 解析标记：兼容"解析：""答案解析：""【解析】"（行首）
               private val NUMBERED_EXP_MARK = Regex("^\\s*(解析|答案解析|【解析】)\\s*[:：]?\\s*(.*)$")
+              // 行内解析标记：答案与解析写在同一行，如"答案： ABCD 解析：原文指出…"或"答案：B【解析】…"。
+              // 真实题库 409 个答案行中有 398 个是这种同行格式，旧版只认行首解析，导致解析被吞进答案。
+              private val NUMBERED_EXP_INLINE = Regex("(?:^|\\s|】)(解析|答案解析|【解析】)\\s*[:：]?\\s*")
+              // 选项行：A、B、C、D 开头；判断是否还有纯答案（用于选项后直接标答案的题库）
+              private val NUMBERED_OPTION_LINE = Regex("^[A-Za-z]\\s*[、.．]")
           
               /**
                * 统一入口：按题库格式自动路由到对应解析器。
@@ -690,9 +695,17 @@ jobs:
                           when {
                               ma != null -> {
                                   zone = 'a'
-                                  val tail = ma.groupValues[2].trim()
-                                  if (tail.isNotEmpty() && !NUMBERED_EXP_MARK.containsMatchIn(tail)) {
-                                      ans.append(tail).append('\n')
+                                  var tail = ma.groupValues[2].trim()
+                                  // 关键：答案与解析常写在同一行（"答案：ABCD 解析：原文…"），
+                                  // 必须在 tail 内就地切出解析，否则 398/409 题的解析被吞进答案。
+                                  NUMBERED_EXP_INLINE.find(tail)?.let { im ->
+                                      val cut = im.range.first
+                                      val after = tail.substring(cut + im.value.length).trim()
+                                      tail = tail.substring(0, cut).trim()
+                                      if (tail.isNotEmpty()) ans.append(tail).append('\n')
+                                      if (after.isNotEmpty()) { exp.append(after).append('\n'); zone = 'e' }
+                                  } ?: run {
+                                      if (tail.isNotEmpty()) ans.append(tail).append('\n')
                                   }
                               }
                               me != null -> {
@@ -701,7 +714,17 @@ jobs:
                                   if (tail.isNotEmpty()) exp.append(tail).append('\n')
                               }
                               zone == 'q' -> q.append(line).append('\n')
-                              zone == 'a' -> ans.append(line).append('\n')
+                              zone == 'a' -> {
+                                  // 答案区后续行里若突然出现行内解析（跨行情况），同样就地切分
+                                  NUMBERED_EXP_INLINE.find(line)?.let { im ->
+                                      val cut = im.range.first
+                                      val before = line.substring(0, cut).trim()
+                                      val after = line.substring(cut + im.value.length).trim()
+                                      if (before.isNotEmpty()) ans.append(before).append('\n')
+                                      if (after.isNotEmpty()) exp.append(after).append('\n')
+                                      zone = 'e'
+                                  } ?: ans.append(line).append('\n')
+                              }
                               else -> exp.append(line).append('\n')
                           }
                       }
@@ -1479,42 +1502,113 @@ jobs:
                   return cropped
               }
           
+              /**
+               * OCR 方向自适应：MediaProjection 截屏的位图方向在不同设备/横竖屏下不一致，
+               * 固定 rotation=0 会导致部分场景文字旋转、识别乱码。这里对同一 bitmap 依次用
+               * 0/90/180/270 四个方向识别，取中文字符数最多的结果作为最终文本。
+               * 用 InputImage 的 rotation 参数（引擎内部旋转），不新建 bitmap，零额外内存；
+               * 串行递归避免并发回调聚合与重复回收；任一方向结果已足够好时提前收敛。
+               */
               private fun runOcr(bitmap: Bitmap) {
                   if (destroyed) {
                       runCatching { bitmap.recycle() }
                       finishFlow()
                       return
                   }
+                  tryOcrDirection(bitmap, OCR_DIRECTIONS, 0, "", 0)
+              }
+          
+              private val OCR_DIRECTIONS = intArrayOf(0, 90, 180, 270)  // ML Kit 是逆时针旋转角度
+          
+              /** 串行尝试各方向；bestText/bestScore 在回调链里传递，避免共享可变状态。
+               *  显式 : Unit —— 递归函数在 K2 下必须声明返回类型，否则编译报"递归调用无显式返回类型"。 */
+              private fun tryOcrDirection(
+                  bitmap: Bitmap, directions: IntArray, index: Int,
+                  bestText: String, bestScore: Int
+              ): Unit {
+                  if (destroyed) {
+                      runCatching { bitmap.recycle() }
+                      finishFlow()
+                      return
+                  }
+                  if (index >= directions.size) {
+                      deliverOcr(bitmap, bestText)
+                      return
+                  }
+                  val rotation = directions[index]
                   try {
-                      recognizer.process(InputImage.fromBitmap(bitmap, 0))
+                      recognizer.process(InputImage.fromBitmap(bitmap, rotation))
                           .addOnSuccessListener { visionText ->
-                              runCatching { bitmap.recycle() }
-                              if (destroyed) {
-                                  finishFlow()
-                                  return@addOnSuccessListener
-                              }
-                              // ML Kit 回调在子线程，异常若不兜住会直接杀进程
-                              try {
-                                  handleQuestion(visionText.text)
-                              } catch (t: Throwable) {
-                                  setResult("识别处理异常：${t.javaClass.simpleName}：${t.message ?: ""}")
-                                  finishFlow()
+                              // 回调异常必须兜住，否则递归链断裂、bitmap 不回收、按钮卡死
+                              runCatching {
+                                  val text = visionText.text.trim()
+                                  val score = scoreOcrText(text)
+                                  val (nText, nScore) = if (score > bestScore) text to score else bestText to bestScore
+                                  // 已识别到足量有效字符（一屏题目通常远超此值），方向正确，提前收敛省算力
+                                  if (nScore >= OCR_ENOUGH_CHARS) {
+                                      deliverOcr(bitmap, nText)
+                                  } else {
+                                      tryOcrDirection(bitmap, directions, index + 1, nText, nScore)
+                                  }
+                              }.onFailure {
+                                  tryOcrDirection(bitmap, directions, index + 1, bestText, bestScore)
                               }
                           }
-                          .addOnFailureListener { e ->
-                              runCatching { bitmap.recycle() }
-                              setResult("OCR 失败：${e.message}")
-                              finishFlow()
+                          .addOnFailureListener {
+                              // 该方向失败（含非法 rotation），尝试下一个；全部失败会走 deliverOcr 空文本
+                              tryOcrDirection(bitmap, directions, index + 1, bestText, bestScore)
                           }
                   } catch (t: Throwable) {
-                      runCatching { bitmap.recycle() }
-                      setResult("OCR 启动失败：${t.javaClass.simpleName}：${t.message ?: ""}")
+                      tryOcrDirection(bitmap, directions, index + 1, bestText, bestScore)
+                  }
+                  Unit
+              }
+          
+              /** OCR 全方向完成后统一回收 bitmap 并交给题目处理；回收恰好一次 */
+              private fun deliverOcr(bitmap: Bitmap, text: String) {
+                  runCatching { bitmap.recycle() }
+                  if (destroyed) {
+                      finishFlow()
+                      return
+                  }
+                  try {
+                      handleQuestion(text)
+                  } catch (t: Throwable) {
+                      setResult("识别处理异常：${t.javaClass.simpleName}：${t.message ?: ""}")
                       finishFlow()
                   }
               }
           
-              // ---------------- 题目处理（单题 / 多题） ----------------
+              /**
+               * OCR 文本评分：方向正确时文字多、方向错时几乎无有效字符。
+               * 中文/日文按 3 分、字母数字按 1 分加权——兼顾纯英文题目，避免只数中文误判。
+               */
+              private fun scoreOcrText(s: String): Int {
+                  var score = 0
+                  for (ch in s) {
+                      when {
+                          ch in '\u4E00'..'\u9FFF' -> score += 3
+                          ch.isLetterOrDigit() -> score += 1
+                      }
+                  }
+                  return score
+              }
           
+              /**
+               * 题干压缩展示：OCR 出的题干含全部 A/B/C/D 选项，很长；悬浮窗答案区仅 45% 屏高，
+               * 原样塞入会把答案顶到滚动区下方（用户又看不到答案）。这里截到第一个选项行之前，
+               * 只保留题号+题干主干；找不到选项行时按长度兜底截断。
+               */
+              private fun briefQuestion(q: String): String {
+                  val t = q.trim()
+                  val opt = Regex("(?:^|\\n)\\s*[A-Da-d]\\s*[、.．)]").find(t)
+                  val head = if (opt != null && opt.range.first > 0) t.substring(0, opt.range.first) else t
+                  val trimmed = head.trim()
+                  return if (trimmed.length > 160) trimmed.substring(0, 160) + "…" else trimmed
+              }
+
+              // ---------------- 题目处理（单题 / 多题） ----------------
+
               private fun handleQuestion(ocrText: String) {
                   if (destroyed) {
                       finishFlow()
@@ -1535,8 +1629,10 @@ jobs:
                       }
           
                       if (questions.size == 1) {
-                          answerOne(questions[0]) { ans ->
-                              setResult(ans, isAnswer = true)
+                          val q = questions[0]
+                          answerOne(q) { ans ->
+                              // 单题也带题干：压缩题干（去掉冗长选项）避免把答案顶出可视区
+                              setResult("【题目】\n${briefQuestion(q)}\n\n$ans", isAnswer = true)
                               finishFlow()
                           }
                           return
@@ -1548,7 +1644,8 @@ jobs:
                       setResult("识别到 ${questions.size} 道题，逐题解答中…")
                       questions.forEachIndexed { i, q ->
                           answerOne(q) { ans ->
-                              results[i] = "【第${i + 1}题】\n$ans"
+                              // 每题都带题干（压缩版）：格式【第N题】→题目主干→答案
+                              results[i] = "【第${i + 1}题】\n${briefQuestion(q)}\n\n$ans"
                               val left = remaining.decrementAndGet()
                               if (left == 0) {
                                   setResult(results.joinToString("\n\n────────────────\n\n"), isAnswer = true)
@@ -1579,8 +1676,10 @@ jobs:
                   try {
                       val local = runCatching { db.search(question) }.getOrNull()?.trim()
                       if (!local.isNullOrEmpty()) {
-                          // 标明来源来自题库：配置了 AI Key 却本地命中时，用户能看清本次走的是题库而非 AI
-                          callback("【题库】\n【答案】\n${TextCleaner.clean(local).trim()}")
+                          // local 已由题库解析器标准化为【答案】…【解析】…格式，这里只加来源标记，
+                          // 绝不能再套一层【答案】——否则会出现截图里的双重【答案】。
+                          val alreadyTagged = local.contains("【答案】")
+                          callback("【题库】\n${if (alreadyTagged) "" else "【答案】\n"}${TextCleaner.clean(local).trim()}")
                           return
                       }
                       // 题库未命中（含查到空答案）→ 继续走 AI 兜底
@@ -1695,8 +1794,10 @@ jobs:
                       }
                   }
                   color(Regex("【第\\d+题】"), COLOR_PRIMARY, true)
+                  color(Regex("【题目】"), COLOR_PRIMARY, true)
                   color(Regex("【答案】"), COLOR_PRIMARY, true)
                   color(Regex("【题库】"), COLOR_PRIMARY, true)
+                  color(Regex("【AI解答】"), COLOR_PRIMARY, true)
                   color(Regex("【解析】"), COLOR_GRAY, false)
                   return ssb
               }
@@ -1884,6 +1985,9 @@ jobs:
                   const val EXTRA_DATA = "data"
                   private const val CHANNEL_ID = "screenqa"
                   private const val NOTIFICATION_ID = 1
+                  // OCR 方向自适应：评分达到此值即认为方向正确、提前收敛（中文权重3、字母数字1）
+                  // 阈值 80（约27个中文字符）：水印/状态栏等无关字符达不到，避免错方向误收敛
+                  private const val OCR_ENOUGH_CHARS = 80
           
                   // 作业帮式配色：主色蓝、卡片白、正文深灰、解析灰
                   private val COLOR_PRIMARY = 0xFF4A90D9.toInt()
@@ -2517,8 +2621,10 @@ jobs:
            */
           object QuestionSplitter {
           
+              // 题号后允许空格：OCR 常把"3、"识别成"3 、"或"3 、"，旧版 [.、．] 不容空格导致漏切、
+              // 该题被并入上一题——这是"屏幕识别漏题"的主因。同时兼容 第N题/（N）/纯数字后空格+选项。
               private val QUESTION_START = Regex(
-                  "^(\\d{1,4}[.、．]\\s*\\S|[（(]\\d{1,4}[)）]|第\\d+题|【[^】]*题[^】]*】)"
+                  "^(\\d{1,4}\\s*[.、．]\\s*\\S|[（(]\\s*\\d{1,4}\\s*[)）]|第\\s*\\d+\\s*题|【[^】]*题[^】]*】)"
               )
           
               fun split(ocrText: String): List<String> {
